@@ -3,10 +3,38 @@
 Latest (2026-11-06, split from "Break That Denim"): this repo is only HTML printed on the denim. Removed:
 the staged "Beneath" experience (src/stage, its body collider and claw holds, pickNear, camera light, post
 film/glitch, staged camera eye/up, renderer extras), its tools, model and sounds, and the wordmark,
-SEO/OG and deploy assets. The menu now lists premade print designs (src/print/designs, first one shown at
-start); choosing one swaps the HTML on the cloth without resetting it. Records that mention the staged
-scene are kept as history; `tools/studies/foldedfall.ts` (needed the staged dump) is gone, so the
-folded-fragment defect in `2026-10-11-folded-fragment-contact.md` is open without its repro.
+SEO/OG and deploy assets. Records that mention the staged scene are kept as history;
+`tools/studies/foldedfall.ts` (needed the staged dump) is gone, so the folded-fragment defect in
+`2026-10-11-folded-fragment-contact.md` is open without its repro.
+- Prints are standalone pages, one folder each in public/prints (the folder is its name; index.html plus its own files; README), not code. Each is shown in a same-origin
+  `<iframe drawable>` in the cloth canvas: html-in-canvas paints iframe content and fires `paint` on its
+  changes, and `zoom` on the iframe scales its content (the page sees devicePixelRatio x zoom), so pages
+  keep their own document, `html`/`body` styles and scripts. A shadow root or injected markup would not:
+  scripts querying `document` break. Prints must be same-origin (layout height and fonts are read from
+  the page). The next print loads hidden and replaces the current one only once loaded with its fonts.
+- plugins/prints.ts lists them as `virtual:prints`; in dev it pushes 'prints:list' / 'prints:change' so
+  adding or editing a print never reloads the app (Vite reloads only a page at a changed .html's own
+  path, so public prints do not trigger it).
+- Without html-in-canvas no print is loaded and the menu is hidden.
+- The page is the yarns' dye (render_common dyeOf/yarnLook): no indigo or undyed weft any more; both
+  families ring-dyed with the page colour at their rest point, the rest of the yarn model (depth
+  variation, mottle, wear exposing the undyed core) unchanged. Threads (thread.wgsl threadDye) and edge
+  fibre (fuzz.wgsl, fibre albedo from the dye by R = (1 - s) / (1 + s)) carry the colour of where they
+  came from. The screen-print ink film model (crown ink, cracks, front face only) is gone: dyed through.
+  Transparent page = undyed cotton; beyond the page's rectangle the texture's clamped edge continues it.
+- Framing (printPlacement.ts fitDistance): the camera stands no farther than keeps every screen corner
+  on the coupon, for any window aspect; wheel zoom-out stops there (was 1.15). The page covers the bbox
+  of the screen corners at that framing (zoom never moves it; a resize re-places it) and is laid out at
+  the screen's CSS scale. Texture: 1.5 texels per drawing-buffer pixel covered, at most 4096 on the long
+  side (0.1 mm over the visible cloth would be ~5500 wide).
+- Interactive mode (print/interactive.ts, I): canvas children are not hit testable until given a canvas
+  transform (updateElementGeometry; Chrome 157 applies it in the element's unzoomed CSS px, then scales
+  by the element's zoom). One affine per element, re-aligned at the pointer from a GPU pick
+  (interact.wgsl pickFace: the intact face of the ray's nearest hit, lattice coords and screen slope;
+  strands and torn per-crossing cells are not page). Real browser input as a result; the alignment is
+  exact at the picked point and trails a moving pointer by the pick round trip (~31 ms median, 61 ms
+  p90 headless), extrapolated to first order meanwhile. Re-picked per frame only while the cloth moves
+  ('motion').
 
 Latest (2026-10-11, floor contact): `docs/decisions/2026-10-11-floor-contact.md` (uncommitted). Free play
 collides with the floor 12 cm below (FLOOR_Z, src/simulation/floor.ts): self-contact cubic + friction in

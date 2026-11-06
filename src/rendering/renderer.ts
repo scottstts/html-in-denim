@@ -60,8 +60,6 @@ const COV_BLOCK = 4;
 const KEY_ANGULAR_RADIUS = (3 * (2 * SHADOW_HALF)) / SHADOW_SIZE / 2e-3;
 /** Bytes of the frame uniform (render_common.wgsl FrameU). */
 const FRAME_BYTES = 400;
-/** Height of the printed design on the cloth (m), centred on the coupon: a chest-print size in this framing. */
-const PRINT_HEIGHT = 0.2;
 
 /** An image for the floor material: decoded RGBA8 bytes (headless) or a browser image bitmap. */
 export type FloorImage = ImageBitmap | { width: number; height: number; data: Uint8Array };
@@ -485,7 +483,9 @@ export class Renderer {
     ]);
     this.weaveTile = this.buildWeaveTile(common);
     // the printed design on the outer layer's face, centred on the coupon (rest chart)
-    this.print = new PrintLayer(device, { layer: 0, center: scene.layers[0].restCenter, height: PRINT_HEIGHT });
+    // placed over the part of the cloth the view shows once the view's size is known (Engine)
+    const L0 = scene.layers[0];
+    this.print = new PrintLayer(device, { layer: 0, center: L0.restCenter, width: (L0.nx - 1) * L0.material.pitchU, height: (L0.ny - 1) * L0.material.pitchV });
     this.tileSampler = device.createSampler({ addressModeU: 'repeat', addressModeV: 'repeat', magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', maxAnisotropy: 16 });
 
     const V = GPUShaderStage.VERTEX;
@@ -523,14 +523,20 @@ export class Renderer {
         { binding: 19, visibility: F, buffer: { type: 'uniform' } },
       ],
     });
+    // the page the yarns are dyed with (print.ts): read where a fibre or thread is shaded
+    const pageEntries = (b: number): GPUBindGroupLayoutEntry[] => [
+      { binding: b, visibility: VF, texture: { sampleType: 'float' } },
+      { binding: b + 1, visibility: VF, sampler: { type: 'filtering' } },
+      uni(b + 2),
+    ];
     const fuzzLayout = device.createBindGroupLayout({
       label: 'fuzz',
       // fibre strands are lit per vertex
-      entries: [uni(0), uni(1), ro(2), ro(3), ro(4), ...shadowEntries(9, VF), { binding: 11, visibility: VF, texture: { sampleType: 'depth' } }],
+      entries: [uni(0), uni(1), ro(2), ro(3), ro(4), ...shadowEntries(9, VF), { binding: 11, visibility: VF, texture: { sampleType: 'depth' } }, ...pageEntries(12)],
     });
     const threadLayout = device.createBindGroupLayout({
       label: 'thread',
-      entries: [uni(0), uni(1), ro(2), ro(3), ro(4), ro(5), ro(6), ro(7), ro(8), ...shadowEntries(9), ro(11), { binding: 12, visibility: F, texture: { sampleType: 'depth' } }],
+      entries: [uni(0), uni(1), ro(2), ro(3), ro(4), ro(5), ro(6), ro(7), ro(8), ...shadowEntries(9), ro(11), { binding: 12, visibility: F, texture: { sampleType: 'depth' } }, ...pageEntries(13)],
     });
 
     const depth: GPUDepthStencilState = { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' };
@@ -584,7 +590,13 @@ export class Renderer {
     const overView = this.overTex.createView();
     // the shaded passes read both shadow maps; the two shadow passes (each writing one) neither
     const print = this.print;
-    // the surface groups hold the print's texture: rebuilt when a design of another size replaces it
+    const pageResources = (b: number): GPUBindGroupEntry[] => [
+      { binding: b, resource: print.view },
+      { binding: b + 1, resource: print.sampler },
+      { binding: b + 2, resource: { buffer: print.uniform } },
+    ];
+    // the surface, thread and fibre groups hold the page's texture: rebuilt when a page of another size
+    // replaces it
     const surfaceGroups = () => {
       for (const [suffix, shadow, over, frame] of [
         ['', shadowView, overView, this.frameU],
@@ -618,32 +630,33 @@ export class Renderer {
         });
       }
     };
-    surfaceGroups();
-    print.onViewChange = surfaceGroups;
-    for (const [suffix, shadow, over, frame] of [
-      ['', shadowView, overView, this.frameU],
-      ['Shadow', dummyView, dummyView, this.frameU],
-      ['Over', dummyView, dummyView, this.frameOverU],
-    ] as const) {
-      this.groups[`thread${suffix}`] = device.createBindGroup({
-        layout: threadLayout,
-        entries: [
-          { binding: 0, resource: { buffer: frame } },
-          { binding: 1, resource: { buffer: this.renderU } },
-          { binding: 2, resource: { buffer: solver.x } },
-          { binding: 3, resource: { buffer: solver.segs } },
-          { binding: 4, resource: { buffer: this.tframe } },
-          { binding: 5, resource: { buffer: this.nrm } },
-          { binding: 6, resource: { buffer: this.runs } },
-          { binding: 7, resource: { buffer: this.chunks } },
-          { binding: 8, resource: { buffer: this.runGeo } },
-          { binding: 11, resource: { buffer: this.tails } },
-          { binding: 9, resource: shadow },
-          { binding: 10, resource: this.shadowSampler },
-          { binding: 12, resource: over },
-        ],
-      });
-    }
+    const threadGroups = () => {
+      for (const [suffix, shadow, over, frame] of [
+        ['', shadowView, overView, this.frameU],
+        ['Shadow', dummyView, dummyView, this.frameU],
+        ['Over', dummyView, dummyView, this.frameOverU],
+      ] as const) {
+        this.groups[`thread${suffix}`] = device.createBindGroup({
+          layout: threadLayout,
+          entries: [
+            { binding: 0, resource: { buffer: frame } },
+            { binding: 1, resource: { buffer: this.renderU } },
+            { binding: 2, resource: { buffer: solver.x } },
+            { binding: 3, resource: { buffer: solver.segs } },
+            { binding: 4, resource: { buffer: this.tframe } },
+            { binding: 5, resource: { buffer: this.nrm } },
+            { binding: 6, resource: { buffer: this.runs } },
+            { binding: 7, resource: { buffer: this.chunks } },
+            { binding: 8, resource: { buffer: this.runGeo } },
+            { binding: 11, resource: { buffer: this.tails } },
+            { binding: 9, resource: shadow },
+            { binding: 10, resource: this.shadowSampler },
+            { binding: 12, resource: over },
+            ...pageResources(13),
+          ],
+        });
+      }
+    };
     for (const [name, frame, shadow, over] of [
       ['mount', this.frameU, shadowView, overView],
       ['mountShadow', this.frameU, dummyView, dummyView],
@@ -660,19 +673,29 @@ export class Renderer {
         ],
       });
     }
-    this.groups.fuzz = device.createBindGroup({
-      layout: fuzzLayout,
-      entries: [
-        { binding: 0, resource: { buffer: this.frameU } },
-        { binding: 1, resource: { buffer: this.renderU } },
-        { binding: 2, resource: { buffer: this.edgeList } },
-        { binding: 3, resource: { buffer: this.edgeRoots } },
-        { binding: 4, resource: { buffer: solver.field } },
-        { binding: 9, resource: shadowView },
-        { binding: 10, resource: this.shadowSampler },
-        { binding: 11, resource: overView },
-      ],
-    });
+    const fuzzGroup = () => {
+      this.groups.fuzz = device.createBindGroup({
+        layout: fuzzLayout,
+        entries: [
+          { binding: 0, resource: { buffer: this.frameU } },
+          { binding: 1, resource: { buffer: this.renderU } },
+          { binding: 2, resource: { buffer: this.edgeList } },
+          { binding: 3, resource: { buffer: this.edgeRoots } },
+          { binding: 4, resource: { buffer: solver.field } },
+          { binding: 9, resource: shadowView },
+          { binding: 10, resource: this.shadowSampler },
+          { binding: 11, resource: overView },
+          ...pageResources(12),
+        ],
+      });
+    };
+    const pageGroups = () => {
+      surfaceGroups();
+      threadGroups();
+      fuzzGroup();
+    };
+    pageGroups();
+    print.onViewChange = pageGroups;
 
     const postModule = shaderModule(device, 'post', common + postWgsl);
     this.postLayout = device.createBindGroupLayout({
@@ -917,9 +940,10 @@ export class Renderer {
     return buf;
   }
 
-  /** A new rendering of the printed design; drawn from the next frame on. */
-  setPrint(src: PrintSource): void {
-    this.print.set(src);
+  /** A new rendering of the printed design (null: none); drawn from the next frame on. */
+  setPrint(src: PrintSource | null): void {
+    if (src) this.print.set(src);
+    else this.print.clear();
   }
 
   /** Rebuild field-derived state from scratch on the next frame (scene reset). */

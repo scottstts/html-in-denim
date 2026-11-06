@@ -3,7 +3,7 @@ import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
-  { ignores: ['dist', 'node_modules', 'artifacts', 'refs'] },
+  { ignores: ['dist', 'node_modules', 'artifacts', 'refs', 'public'] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
@@ -16,7 +16,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ['tools/**/*.{ts,mjs}'],
+    files: ['tools/**/*.{ts,mjs}', 'plugins/**/*.ts', 'vite.config.ts'],
     languageOptions: { globals: { ...globals.node } },
   },
 );

@@ -65,7 +65,8 @@ struct GripEntry {
 // candidate (screen distance << 20 | node), [4, 4 + MAX_CAND) candidates, then their occluded flags
 @group(0) @binding(9) var<storage, read_write> pick: array<atomic<u32>>;
 // [0..2] picked point (f32 bits), [3] node, [4] kind (0 none, 1 surface hit, 2 proximity),
-// [8, 8 + 256) patch window around the node (pickWindow)
+// [8, 8 + 256) patch window around the node (pickWindow), [PAGE_OUT, PAGE_OUT + 8) the cloth face under
+// the pointer (pickFace)
 @group(0) @binding(10) var<storage, read_write> pickOut: array<u32>;
 // [3g] effective handle of grip g (xyz), [3g + 1] its origin: the picked node's position at grab time,
 // [3g + 2] the pads' closing axis (unit, world; from the grab-time offsets)
@@ -439,4 +440,59 @@ fn pickWindow(@builtin(local_invocation_index) k: u32) {
   if (spanOn(m, 1u)) { b |= 2u; }
   if (!live(m)) { b |= 4u; }
   pickOut[8u + k] = b;
+}
+
+// ---------------------------------------------------------------- the cloth under the pointer
+
+const PAGE_OUT: u32 = 264u;
+
+// The intact face whose surface is the pointer ray's nearest hit (pickRay) reports where on the cloth
+// the pointer is: [PAGE_OUT] its layer (NONE if the hit is no face: a strand over an opening),
+// [+1, +2] the point's lattice coordinates (column, row; f32 bits), [+3 .. +6] how the screen point
+// moves per lattice unit there (drawing-buffer px: d/dcolumn x, y, d/drow x, y). The caller sets
+// [PAGE_OUT] to NONE first.
+@compute @workgroup_size(128)
+fn pickFace(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let f = gid.x;
+  if (f >= P.counts.x || !faceValid(f)) { return; }
+  let front = atomicLoad(&pick[0]);
+  if (front == NONE) { return; }
+  let o = PK.eye.xyz;
+  let d = PK.ray.xyz;
+  let L = lat(f);
+  let c = vec4<u32>(f, f + 1u, f + L.y, f + L.y + 1u);
+  let p00 = x[c.x].xyz;
+  let p10 = x[c.y].xyz;
+  let p01 = x[c.z].xyz;
+  let p11 = x[c.w].xyz;
+  let s00 = project(p00).xy;
+  let s10 = project(p10).xy;
+  let s01 = project(p01).xy;
+  let s11 = project(p11).xy;
+  // (lattice offset in the cell, screen derivatives along column and row) of the triangle hit
+  var a = vec2<f32>(0.0);
+  var dA = vec2<f32>(0.0);
+  var dB = vec2<f32>(0.0);
+  let h1 = rayTri(o, d, p00, p10, p11);
+  let h2 = rayTri(o, d, p00, p11, p01);
+  if (h1.x > 0.0 && bitcast<u32>(h1.x) == front) {
+    // p00 (0, 0), p10 (1, 0), p11 (1, 1)
+    a = vec2<f32>(h1.y + h1.z, h1.z);
+    dA = s10 - s00;
+    dB = s11 - s10;
+  } else if (h2.x > 0.0 && bitcast<u32>(h2.x) == front) {
+    // p00 (0, 0), p11 (1, 1), p01 (0, 1)
+    a = vec2<f32>(h2.y, h2.y + h2.z);
+    dA = s11 - s01;
+    dB = s01 - s00;
+  } else {
+    return;
+  }
+  pickOut[PAGE_OUT] = nodes[f].ijl >> 24u;
+  pickOut[PAGE_OUT + 1u] = bitcast<u32>(f32(col(f)) + a.x);
+  pickOut[PAGE_OUT + 2u] = bitcast<u32>(f32(row(f)) + a.y);
+  pickOut[PAGE_OUT + 3u] = bitcast<u32>(dA.x);
+  pickOut[PAGE_OUT + 4u] = bitcast<u32>(dA.y);
+  pickOut[PAGE_OUT + 5u] = bitcast<u32>(dB.x);
+  pickOut[PAGE_OUT + 6u] = bitcast<u32>(dB.y);
 }

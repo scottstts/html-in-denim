@@ -43,7 +43,8 @@ fn fiberShade(N: vec3<f32>, T: vec3<f32>, V: vec3<f32>, Ldir: vec3<f32>, albedo:
   let sin2 = max(1.0 - NH * NH, 0.0078125);
   let D = (2.0 + inv) * pow(sin2, inv * 0.5) / (2.0 * PI);
   let vis = 1.0 / (4.0 * (lam + NV - lam * NV) + 1e-4);
-  let sheenCol = mix(albedo * 2.5, vec3<f32>(0.30, 0.36, 0.50), 0.5);
+  // loose surface fibre: its dyed fibre, with the undyed cores of broken and untwisted ones
+  let sheenCol = mix(albedo * 2.5, mix(albedo, UNDYED, 0.5), 0.5);
   let sheen = sheenCol * fuzz * 0.22 * D * vis * lam;
   return diff + spec + sheen;
 }

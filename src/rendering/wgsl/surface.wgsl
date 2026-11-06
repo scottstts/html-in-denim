@@ -28,17 +28,10 @@
 @group(0) @binding(14) var<storage, read> tframe: array<vec4<f32>>;
 @group(0) @binding(15) var<storage, read> kappaM: array<u32>;
 @group(0) @binding(16) var overMap: texture_depth_2d;
-// the printed design (print.ts): linear premultiplied ink coverage, mipmapped
+// the page the yarns are dyed with (print.ts; render_common.wgsl PrintU): linear premultiplied, mipmapped
 @group(0) @binding(17) var printTex: texture_2d<f32>;
 @group(0) @binding(18) var printSampler: sampler;
 @group(0) @binding(19) var<uniform> P: PrintU;
-
-struct PrintU {
-  // the print's rectangle in its layer's rest chart: left u, top v (m), 1 / width, 1 / height (1/m)
-  rect: vec4<f32>,
-  // layer printed, 1 once a design has arrived, texture width and height (texels)
-  info: vec4<u32>,
-};
 
 
 struct VOut {
@@ -321,79 +314,31 @@ fn rimAt(d: f32, dir: vec2<f32>, rest: vec2<f32>, layer: u32, density: f32) -> R
   return o;
 }
 
-// The rim's loosened, untwisted fibres at a rest point: their albedo (undyed weft and pale warp cores
-// with some dyed fibre) in rgb and how densely they cover the weave in w. Fibre tufts are drawn out
+// The rim's loosened, untwisted fibres at a rest point, of yarns dyed `dye`: their albedo (mostly the
+// undyed cores of broken and untwisted yarn, with some dyed fibre) in rgb and how densely they cover
+// the weave in w. Fibre tufts are drawn out
 // across the edge (dir: away from it), so the band is streaked like a fringe, with gaps where the
 // dyed weave still shows.
-fn rimFibres(rest: vec2<f32>, dir: vec2<f32>, layer: u32, pix: f32) -> vec4<f32> {
+fn rimFibres(rest: vec2<f32>, dir: vec2<f32>, layer: u32, pix: f32, dye: vec3<f32>) -> vec4<f32> {
   let fine = clamp(1.6 - pix / 0.2e-3, 0.0, 1.0);
   let q = vec2<f32>(dot(rest, dir), dot(rest, vec2<f32>(-dir.y, dir.x)));
   let streak = noise2(5003u + layer, q / vec2<f32>(1.4e-3, 0.22e-3));
   let tuft = noise2(5009u + layer, rest / 0.6e-3);
   let clump = noise2(5021u + layer, rest / 2.2e-3);
-  let blue = 0.5 + 0.5 * noise2(5011u + layer, rest / 1.6e-3);
-  // undyed weft and the pale cores of untwisted warp, with some fibre that keeps its indigo
-  let pale = vec3<f32>(0.64, 0.67, 0.73);
-  let dyed = vec3<f32>(0.2, 0.28, 0.5);
-  let alb = mix(pale, dyed, 0.3 * blue) * (0.86 + 0.26 * (0.6 * streak + 0.4 * tuft) * fine);
+  let dyedShare = 0.5 + 0.5 * noise2(5011u + layer, rest / 1.6e-3);
+  // the undyed cores of untwisted yarn, with some fibre that keeps its dye
+  let alb = mix(UNDYED, mix(dye, UNDYED, 0.3), 0.3 * dyedShare) * (0.86 + 0.26 * (0.6 * streak + 0.4 * tuft) * fine);
   let cover = clamp(0.8 + 0.2 * clump + 0.3 * (0.65 * streak + 0.35 * tuft) * fine, 0.0, 1.0);
   return vec4<f32>(alb, cover);
 }
 
-// ---------------------------------------------------------------- print
-// A screen print on the face of the cloth: ink laid down on the yarns that were on top when it was
-// printed (at rest), thickest on their crowns, thinner where the squeegee only partly filled the
-// interstices. It belongs to the yarn material, so it stretches, folds and tears with it: a stretched
-// weave shows the unprinted yarn surfaces that were hidden at print time, a separated yarn takes its
-// ink with it, and the yarn beneath it was never printed.
+// ---------------------------------------------------------------- dye
 
-fn printUV(rest: vec2<f32>) -> vec2<f32> {
-  return vec2<f32>((rest.x - P.rect.x) * P.rect.z, (P.rect.y - rest.y) * P.rect.w);
-}
-
-// Ink at print coordinates puv (premultiplied linear colour, coverage), filtered over gradients g.
-fn inkAt(puv: vec2<f32>, gx: vec2<f32>, gy: vec2<f32>) -> vec4<f32> {
-  if (any(puv < vec2<f32>(0.0)) || any(puv > vec2<f32>(1.0))) { return vec4<f32>(0.0); }
-  return textureSampleGrad(printTex, printSampler, puv, gx, gy);
-}
-
-// Reflectance of the cured ink film (straight colour): plastisol over denim never reaches the white of
-// the design; dark inks keep a little of their pigment's scatter.
-fn inkAlbedo(ik: vec4<f32>) -> vec3<f32> {
-  let c = min(ik.rgb / max(ik.a, 1e-4), vec3<f32>(1.0));
-  return 0.012 + 0.8 * c;
-}
-
-// The cured film is far less extensible than the cloth: it parts in a network of cells a millimetre
-// or two across. Aged ink has hairline cracks, worn ink wider ones, and stretch opens them (strain:
-// the weave's largest stretch beyond rest). The film's surviving share of a pixel of footprint foot (m).
-fn inkCracks(rest: vec2<f32>, strain: f32, wear: f32, foot: f32) -> f32 {
-  let cell = 1.6e-3;
-  // wandering crack lines, not straight Voronoi edges
-  let warp = vec2<f32>(noise2(6101u, rest / 0.9e-3), noise2(6113u, rest / 0.9e-3));
-  let p = rest / cell + 0.22 * warp;
-  let ip = floor(p);
-  let fp = p - ip;
-  var d1 = 9.0;
-  var d2 = 9.0;
-  for (var j = -1; j <= 1; j++) {
-    for (var i = -1; i <= 1; i++) {
-      let id = vec2<i32>(ip) + vec2<i32>(i, j);
-      let h = hash11((bitcast<u32>(id.x) * 73856093u) ^ (bitcast<u32>(id.y) * 19349663u) ^ 7177u);
-      let o = vec2<f32>(f32(i), f32(j)) + vec2<f32>(0.15 + 0.7 * hashf(h), 0.15 + 0.7 * hashf(h ^ 0x68bc21ebu));
-      let d = length(o - fp);
-      if (d < d1) {
-        d2 = d1;
-        d1 = d;
-      } else if (d < d2) {
-        d2 = d;
-      }
-    }
-  }
-  // distance to the nearest cell boundary (m) against the crack's half width
-  let e = 0.5 * (d2 - d1) * cell;
-  let w = (0.01 + 0.035 * wear) * cell + 0.7 * max(strain - 0.01, 0.0) * cell;
-  return smoothstep(w - 0.5 * foot, w + 0.5 * foot, e);
+// The page's dye at a rest point of the dyed layer (render_common.wgsl dyeOf), filtered over the
+// page-coordinate gradients gx, gy; undyed cotton on other layers and before a page has arrived.
+fn dyeAt(on: bool, rest: vec2<f32>, gx: vec2<f32>, gy: vec2<f32>) -> vec3<f32> {
+  if (!on) { return UNDYED; }
+  return dyeOf(textureSampleGrad(printTex, printSampler, printUV(P, rest), gx, gy));
 }
 
 @fragment
@@ -453,27 +398,18 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
   // direct irradiance on the cloth's plane, for the haze of fibres bridging the grooves
   let hazeE = key.w * sh * max(dot(Nf, key.xyz), 0.0) * F.keyColor.rgb + over * max(dot(Nf, F.overDir.xyz), 0.0);
   // the rim's loose fibres: pale albedo, more sheen, weave washed out toward the edge
+  // the dye: the page where the cloth's yarns lie at rest, filtered over this pixel's footprint (the
+  // samples below take their own yarn's)
+  let pitchM = LR.pitch.xy;
+  let dyeGx = dx * pitchM * vec2<f32>(P.rect.z, -P.rect.w);
+  let dyeGy = dy * pitchM * vec2<f32>(P.rect.z, -P.rect.w);
+  let dyed = P.info.y == 1u && in.layer == P.info.x;
+  let dye0 = dyeAt(dyed, rest, dyeGx, dyeGy);
   var fib = vec4<f32>(0.0);
-  if (rim.rim > 0.0) { fib = rimFibres(rest, rim.dir, in.layer, pix); }
+  if (rim.rim > 0.0) { fib = rimFibres(rest, rim.dir, in.layer, pix, dye0); }
   let rimPale = pow(rim.rim, 0.7) * fib.w;
   let rimAlb = fib.rgb;
   let rimFuzz = 0.9 * rim.rim;
-
-  // the print: on the face of its layer only, and only where this pixel can reach it
-  let strain = max(su, sv) - 1.0;
-  let pitchM = LR.pitch.xy;
-  let inkGx = dx * pitchM * vec2<f32>(P.rect.z, -P.rect.w);
-  let inkGy = dy * pitchM * vec2<f32>(P.rect.z, -P.rect.w);
-  let puv0 = printUV(rest);
-  let reach = abs(inkGx) + abs(inkGy) + vec2<f32>(0.002);
-  var inkOn = P.info.y == 1u && in.layer == P.info.x && front && all(puv0 > -reach) && all(puv0 < vec2<f32>(1.0) + reach);
-  // the film's per-pixel share: cracks, and the rim's loosened fibres that left it behind
-  var inkKeep = 0.0;
-  if (inkOn) {
-    inkKeep = inkCracks(rest, strain, wearF, pix) * (1.0 - rimPale);
-    inkOn = inkKeep > 1e-3;
-  }
-
 
   // 4x MSAA standard sample offsets (pixel units, y down); each also jittered over the hairiness
   // radius (~45 um, wider in the loosened rim), which blurs the weave the way loose fibres do
@@ -483,9 +419,8 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
   let rotSeed = hash11(u32(in.pos.x) * 7919u + u32(in.pos.y));
   let rot = hashf(rotSeed) * 6.2831853;
   let hTop = LR.warp.z + 0.5 * LR.warp.y;
-  // family-mean albedos for the softly blended second yarn
-  let warpMean = vec3<f32>(0.045, 0.065, 0.135);
-  let weftMean = vec3<f32>(0.26, 0.27, 0.28);
+  // loose fibre bridging the grooves: dyed surface fibre and undyed cores
+  let hazeAlb = mix(dye0, UNDYED, 0.5);
   // per sample: woven geometry and appearance; lighting once per pixel on the averaged inputs
   // (Lambert is linear in the normal; the weak specular lobe is the only approximation)
   var albDirect = vec3<f32>(0.0);
@@ -509,13 +444,10 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     var dmg = 0.0;
     var loose = 0.0;
     var present = w2.a.covered;
-    // the sample shows the top yarn (not one beneath a separated or frayed-through one)
-    var top = true;
     if (present) {
       let fs = hash11(rotSeed + 977u * k + 13u);
       let ca = hitDamage(LR, w2.a, uvk);
       if (yarnGone(ca, fs) || hitAbsent(LR, w2.a, uvk)) {
-        top = false;
         present = w2.b.covered && !hitAbsent(LR, w2.b, uvk);
         hit = w2.b;
         if (!present && w2.a.fam == 1u) {
@@ -542,12 +474,23 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     }
     if (present) { mask |= (1u << k); }
     if (!present) { continue; }
-    let look = yarnLook(LR, in.layer, hit.fam, hit.yarn, hit.float_, hit.along, hit.x, min(1.0, wearF + 0.7 * dmg), pix, loose);
+    // the yarn's dye: the page where this point of it lay at rest (lateral offsets are physical: a
+    // stretched weave spreads its yarns apart, they do not widen)
+    var Ur = uvk.x;
+    var Vr = uvk.y;
+    if (hit.fam == 1u) {
+      Ur = f32(hit.yarn) + hit.x * 0.5 * LR.warp.x / LR.pitch.x;
+    } else {
+      Vr = f32(hit.yarn) + hit.x * 0.5 * LR.weft.x / LR.pitch.y;
+    }
+    let dye = dyeAt(dyed, restOfUV(LR, vec2<f32>(Ur, Vr)), 0.5 * dyeGx, 0.5 * dyeGy);
+    let look = yarnLook(LR, in.layer, hit.fam, hit.yarn, hit.float_, hit.along, hit.x, min(1.0, wearF + 0.7 * dmg), pix, loose, dye);
     var albedo = look.albedo;
     var slope = hit.slope;
     var h = hit.h;
     if (wb > 0.02) {
-      albedo = mix(albedo, select(weftMean, warpMean, w2.b.fam == 1u) * (1.0 - 0.4 * wearF) + vec3<f32>(0.12) * wearF, wb);
+      // the second yarn's mean look, dyed as its neighbour here
+      albedo = mix(albedo, mix(dye, UNDYED, 0.15) * (1.0 - 0.4 * wearF) + vec3<f32>(0.12) * wearF, wb);
       slope = mix(slope, w2.b.slope, wb);
       h = mix(h, w2.b.h, wb);
     }
@@ -562,44 +505,11 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     let hn = mix(clamp((sgn * h + hTop) / (2.0 * hTop), 0.0, 1.0), 0.7, rim.rim);
     // interstices between floats (where the weft shows) are deep and shadowed by the neighbours
     let ao = weaveOcclusion(hn) * rim.ao;
-    var inkCov = 0.0;
-    if (inkOn && top) {
-      // where this point of the yarn lay at rest, when it was printed (lateral offsets are physical:
-      // a stretched weave spreads its yarns apart, they do not widen)
-      var Ur = uvk.x;
-      var Vr = uvk.y;
-      if (hit.fam == 1u) {
-        Ur = f32(hit.yarn) + hit.x * 0.5 * LR.warp.x / LR.pitch.x;
-      } else {
-        Vr = f32(hit.yarn) + hit.x * 0.5 * LR.weft.x / LR.pitch.y;
-      }
-      // stretched open, the weave shows yarn surfaces its neighbours covered at rest: unprinted
-      var shown = true;
-      if (strain > 0.01) {
-        let wr = weave2(LR, Ur, Vr, 1.0, 1.0, front, 0.018e-3);
-        shown = wr.a.covered && wr.a.fam == hit.fam && wr.a.yarn == hit.yarn;
-      }
-      if (shown) {
-        let ik = inkAt(printUV(restOfUV(LR, vec2<f32>(Ur, Vr))), 0.5 * inkGx, 0.5 * inkGy);
-        if (ik.a > 1e-3) {
-          // thickest film on the crowns; the squeegee only partly fills the interstices
-          let dep = 0.55 + 0.45 * smoothstep(0.15, 0.6, hn);
-          // wear rubs it off the crowns first; a damaged yarn's loosened fibres shed it
-          let crown = sqrt(max(0.0, 1.0 - hit.x * hit.x));
-          let abr = clamp(0.45 * pow(wearF, 1.5) * (0.35 + 0.65 * crown) + 0.6 * dmg, 0.0, 1.0);
-          // fibre ends poking through the film, below a few pixels averaged into it
-          let film = 1.0 - 0.12 * (0.5 + 0.5 * noise2(6131u, uvk * pitchM / 0.09e-3)) * (0.5 + 0.5 * resolved(0.09e-3, pix));
-          inkCov = ik.a * dep * (1.0 - abr) * film * inkKeep;
-          albedo = mix(albedo, inkAlbedo(ik), inkCov);
-        }
-      }
-    }
     albDirect += albedo * mix(0.55, 1.0, ao);
     albAmb += albedo * ao;
     nSum += Ny;
     tSum += cos(tw) * axis + sin(tw) * cross(Ny, axis);
-    // the film binds the yarn's surface fibres down
-    fuzz += (look.fuzz + rimFuzz + 0.5 * dmg) * (1.0 - 0.6 * inkCov);
+    fuzz += look.fuzz + rimFuzz + 0.5 * dmg;
     groove += 1.0 - hn;
     cnt += 1.0;
   }
@@ -610,7 +520,7 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     let Tl = normalize(tSum - dot(tSum, Nl) * Nl + 1e-6 * Tu);
     acc = fiberShade(Nl, Tl, Vv, key.xyz, albDirect * inv, fuzz * inv) * (key.w * sh) * F.keyColor.rgb + fiberShade(Nl, Tl, Vv, F.overDir.xyz, albDirect * inv, fuzz * inv) * over + amb * albAmb * inv;
     // loose fibres bridging the grooves: a faint haze lifts the deepest points
-    acc = mix(acc, (hazeE * 0.06 + amb * 0.6) * vec3<f32>(0.32, 0.36, 0.48), 0.12 * groove * inv * fuzz * inv);
+    acc = mix(acc, (hazeE * 0.06 + amb * 0.6) * hazeAlb, 0.12 * groove * inv * fuzz * inv);
     acc *= cnt;
   }
   var color = acc / max(cnt, 1.0);
@@ -630,26 +540,17 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     let kk = i32(round(in.uv.x));
     let m = i32(round(in.uv.y));
     let fl = i32(round((in.uv.y - warpUnderDist(LR, kk, in.uv.y)) / rep));
-    let lw = yarnLook(LR, in.layer, 1u, kk, fl, in.uv.y * LR.pitch.y, 0.3, wearF, pix, 0.0);
-    let lf = yarnLook(LR, in.layer, 0u, m, 0, in.uv.x * LR.pitch.x, 0.3, wearF, pix, 1.0 - warpP);
-    var albedo = mix(mix(lf.albedo, lw.albedo, wf), rimAlb, rimPale);
-    var inkCov = 0.0;
-    if (inkOn) {
-      // the resolved samples' mean: film over the crowns (mean deposit and fibre ends), worn ink, and
-      // under stretch the unprinted surfaces opened between the printed ones
-      let ik = inkAt(puv0, inkGx, inkGy);
-      let abr = clamp(0.45 * pow(wearF, 1.5) * 0.8 + 0.6 * weak, 0.0, 1.0);
-      inkCov = ik.a * 0.82 * (1.0 - abr) * inkKeep * min(1.0, 1.0 / max(su * sv, 1e-3)) * warpP;
-      albedo = mix(albedo, inkAlbedo(ik), inkCov);
-    }
+    let lw = yarnLook(LR, in.layer, 1u, kk, fl, in.uv.y * LR.pitch.y, 0.3, wearF, pix, 0.0, dye0);
+    let lf = yarnLook(LR, in.layer, 0u, m, 0, in.uv.x * LR.pitch.x, 0.3, wearF, pix, 1.0 - warpP, dye0);
+    let albedo = mix(mix(lf.albedo, lw.albedo, wf), rimAlb, rimPale);
     let ao = mix(tex.y, 0.8, rim.rim) * rim.ao;
     let tw = mix(LR.weft.w, LR.warp.w, wf);
     let Ta = select(Tu, Tv, wf > 0.5);
     let Tf = normalize(cos(tw) * Ta + sin(tw) * cross(Ny, Ta));
-    let fz = (mix(lf.fuzz, lw.fuzz, wf) + rimFuzz + 0.5 * weak) * (1.0 - 0.6 * inkCov);
+    let fz = mix(lf.fuzz, lw.fuzz, wf) + rimFuzz + 0.5 * weak;
     let albD = albedo * mix(0.55, 1.0, ao);
     var ct = fiberShade(Ny, Tf, Vv, key.xyz, albD, fz) * (key.w * sh) * F.keyColor.rgb + fiberShade(Ny, Tf, Vv, F.overDir.xyz, albD, fz) * over + amb * albedo * ao;
-    ct = mix(ct, (hazeE * 0.06 + amb * 0.6) * vec3<f32>(0.32, 0.36, 0.48), 0.12 * (1.0 - ao) * fz);
+    ct = mix(ct, (hazeE * 0.06 + amb * 0.6) * hazeAlb, 0.12 * (1.0 - ao) * fz);
     color = select(mix(color, ct, lodTile), ct, cnt == 0.0);
     if (lodTile >= 1.0) {
       // coverage of the filtered cloth: holes where both families are gone, dithered over the samples

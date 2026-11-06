@@ -8,10 +8,11 @@ import { GPU_DEFAULTS, GpuSolver, RELEASE_REFINEMENT } from '../simulation/gpu/s
 import { loadDrape, settleDrape } from '../simulation/gpu/settle';
 import { Topology } from '../simulation/gpu/topology';
 import { compileScene, defaultSceneSpecs, type CompiledScene } from '../simulation/scene';
-import { ALL_POINTERS, type DevCommand, type FromEngine, type PointerCommand, type ToEngine } from '../shared/messages';
+import { ALL_POINTERS, type DevCommand, type FromEngine, type PagePoint, type PointerCommand, type ToEngine } from '../shared/messages';
 import { ACOUSTIC_SLOT, ACOUSTIC_SLOTS, RECORD_FLOATS, SOURCES, decodeRecord, fracturePosition } from '../audio/record';
 import { AcousticLog } from './acousticLog';
 import type { PrintSource } from '../rendering/print';
+import { fitDistance, visibleRect } from '../rendering/printPlacement';
 
 interface WorkerScope {
   postMessage(m: FromEngine): void;
@@ -45,6 +46,9 @@ const SIM_FRAME_INTERVAL = 1 / 30 - 0.002;
 /** The cloth is at rest (simulation sleeps) below this nodal speed for REST_TIME seconds. */
 const REST_SPEED = 0.003;
 const REST_TIME = 0.4;
+/** Print texels per drawing-buffer pixel the print covers at the product's framing, and the most on its long side. */
+const PRINT_DENSITY = 1.5;
+const PRINT_MAX_TEXELS = 4096;
 /** Wheel depth per unit deltaY while gripping (m). */
 const WHEEL_DEPTH = 0.00006;
 
@@ -75,6 +79,11 @@ class Engine {
   /** Ruptures + pull-outs at the last connectivity analysis. */
   private topologyEvents = 0;
   private camera: CameraState = { ...DEFAULT_CAMERA };
+  /**
+   * The product's framing at this window's aspect: DEFAULT_CAMERA, brought closer where the window is
+   * wider (or taller) than the cloth, so the cloth always fills it. Zooming out stops there.
+   */
+  private framing: CameraState = { ...DEFAULT_CAMERA };
   private width = 1;
   private height = 1;
   private cssWidth = 1;
@@ -110,6 +119,8 @@ class Engine {
   private probeSteps = 0;
   /** Something visible changed since the last presented frame. */
   private dirty = true;
+  /** The page on the cloth: its rest-chart rectangle (m) and its CSS size (placePrint). */
+  private page: { center: [number, number]; width: number; height: number; cssWidth: number; cssHeight: number } | null = null;
   /** A design that arrived before the renderer existed. */
   private pendingPrint: PrintSource | null = null;
   private lastPresent = 0;
@@ -156,6 +167,7 @@ class Engine {
     this.topology = new Topology(this.device, this.solver, this.scene, () => this.interaction.coreNodes);
     this.renderer = new Renderer(this.device, format, this.solver, this.scene);
     this.renderer.resize(width, height);
+    this.placePrint();
     // free play: torn pieces and long flaps land on the floor drawn beneath the cloth
     this.solver.setFloor(this.renderer.floorZ);
     this.speedProbe = this.device.createBuffer({ label: 'speedProbe', size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
@@ -174,7 +186,7 @@ class Engine {
       this.pendingPrint = null;
     }
     if (this.audioPort) this.startAcoustics();
-    this.asleep = true;
+    this.sleep(true);
     this.lastFrame = performance.now();
     send({ type: 'status', state: 'running' });
     send({ type: 'cursor', cursor: 'grab' });
@@ -217,7 +229,7 @@ class Engine {
     this.topologyEvents = 0;
     this.simBacklog = 0;
     this.refineSteps = 0;
-    this.asleep = true;
+    this.sleep(true);
     this.dirty = true;
   }
 
@@ -230,12 +242,75 @@ class Engine {
     canvas.width = width;
     canvas.height = height;
     this.renderer?.resize(width, height);
+    if (this.renderer) this.placePrint();
     this.dirty = true;
+  }
+
+  /**
+   * Frame the cloth for this aspect (framing), and put the page over the cloth that framing shows
+   * (zooming in does not move it; zooming out stops at it, so the page covers the window at any zoom).
+   * The page is laid out at the screen's scale (the screen's size, plus the corners the cloth's slant
+   * adds), so a page reads at the size it would in a browser window. Its texture has about
+   * PRINT_DENSITY texels per drawing-buffer pixel it covers in that framing (headroom for zooming in),
+   * at most PRINT_MAX_TEXELS on its long side.
+   */
+  private placePrint(): void {
+    const aspect = this.cssWidth / this.cssHeight;
+    const layer = this.scene.layers[0];
+    // the view keeps its zoom into the framing
+    const zoom = Math.min(1, this.camera.distance / this.framing.distance);
+    this.framing = { ...DEFAULT_CAMERA, distance: fitDistance(layer, DEFAULT_CAMERA, aspect) };
+    this.camera.distance = this.framing.distance * zoom;
+    const r = visibleRect(layer, this.framing, aspect);
+    if (!r) return;
+    this.renderer.print.setPlacement({ layer: 0, center: r.center, width: r.width, height: r.height });
+    // at the screen's scale: the screen's width and height on the cloth are its CSS width and height
+    const sx = r.width / r.span[0];
+    const width = Math.max(1, Math.round(this.cssWidth * sx));
+    const height = Math.max(1, Math.round((this.cssHeight * r.height) / r.span[1]));
+    const texels = Math.min(PRINT_MAX_TEXELS, (PRINT_MAX_TEXELS * width) / height, Math.max(256, PRINT_DENSITY * this.width * sx));
+    this.page = { center: r.center, width: r.width, height: r.height, cssWidth: width, cssHeight: height };
+    send({ type: 'printFrame', width, height, texels: Math.round(texels) });
+    this.dirty = true;
+  }
+
+  /**
+   * Where the page is under the pointer at CSS (x, y): the cloth there (Interaction.clothAt, through
+   * folds and tears as they are now) taken to page CSS px, and how the screen moves per page px there
+   * (canvas CSS px). Null over no cloth face (an opening, a strand) or another layer.
+   */
+  async pagePoint(x: number, y: number): Promise<PagePoint | null> {
+    const page = this.page;
+    if (!this.ready || !page) return null;
+    const sx = this.width / this.cssWidth;
+    const sy = this.height / this.cssHeight;
+    const m = cameraMatrices(this.camera, this.width / this.height);
+    const hit = await this.interaction.clothAt(m.viewProj, x * sx, y * sy, this.width, this.height);
+    if (!hit || hit.layer !== 0) return null;
+    const L = this.scene.layers[0];
+    const pu = L.material.pitchU;
+    const pv = L.material.pitchV;
+    // rest chart to page: u to the right, v up the page's height
+    const u = hit.lattice[0] * pu;
+    const v = hit.lattice[1] * pv;
+    const px = ((u - (page.center[0] - page.width / 2)) / page.width) * page.cssWidth;
+    const py = ((page.center[1] + page.height / 2 - v) / page.height) * page.cssHeight;
+    // lattice columns per page px across, rows per page px down
+    const cpx = page.width / (pu * page.cssWidth);
+    const rpy = -page.height / (pv * page.cssHeight);
+    return { x: px, y: py, j: [(hit.perColumn[0] * cpx) / sx, (hit.perColumn[1] * cpx) / sy, (hit.perRow[0] * rpy) / sx, (hit.perRow[1] * rpy) / sy] };
+  }
+
+  /** The simulation sleeps (cloth at rest) or wakes; the page is told (the cloth under a still pointer moves while awake). */
+  private sleep(asleep: boolean): void {
+    if (asleep === this.asleep) return;
+    this.asleep = asleep;
+    send({ type: 'motion', moving: !asleep });
   }
 
   private wake(): void {
     if (this.asleep) {
-      this.asleep = false;
+      this.sleep(false);
       this.restFor = 0;
       this.simBacklog = 0;
     }
@@ -343,7 +418,7 @@ class Engine {
     if (this.grips.size > 0) {
       for (const g of this.grips.values()) g.hand.wheel(-deltaY * WHEEL_DEPTH);
     } else {
-      this.camera.distance = Math.max(0.3, Math.min(1.15, this.camera.distance * Math.exp(deltaY * 0.0008)));
+      this.camera.distance = Math.max(0.3, Math.min(this.framing.distance, this.camera.distance * Math.exp(deltaY * 0.0008)));
       this.dirty = true;
     }
   }
@@ -449,7 +524,7 @@ class Engine {
           return;
         }
         this.restFor = speed < REST_SPEED ? this.restFor + window : 0;
-        if (this.restFor >= REST_TIME) this.asleep = true;
+        if (this.restFor >= REST_TIME) this.sleep(true);
       },
       () => (this.probeBusy = false),
     );
@@ -524,8 +599,8 @@ class Engine {
     }
   }
 
-  /** The printed design changed (main thread's paint): upload it and redraw, asleep or not. */
-  setPrint(src: PrintSource): void {
+  /** The printed design changed (main thread's paint; null: removed): upload it and redraw, asleep or not. */
+  setPrint(src: PrintSource | null): void {
     if (!this.ready) {
       // only the latest rendering matters; it arrives again on the next paint
       this.pendingPrint?.image.close();
@@ -611,6 +686,12 @@ scope.onmessage = (ev: MessageEvent<ToEngine>) => {
       break;
     case 'print':
       engine.setPrint(m.source);
+      break;
+    case 'pagePick':
+      engine.pagePoint(m.x, m.y).then(
+        (point) => send({ type: 'pagePoint', seq: m.seq, point }),
+        () => send({ type: 'pagePoint', seq: m.seq, point: null }),
+      );
       break;
     case 'dev':
       engine.dev(m).then((result) => send({ type: 'devDone', id: m.id, result }), (e: unknown) => send({ type: 'devDone', id: m.id, result: String(e) }));

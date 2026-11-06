@@ -20,10 +20,11 @@ export interface PrintSource {
   height: number;
 }
 
-/** Where the print sits in a layer's rest chart: its centre (m) and height (m); width from the image's aspect. */
+/** Where the print sits in a layer's rest chart: its centre and size (m); the image is stretched over it. */
 export interface PrintPlacement {
   layer: number;
   center: [number, number];
+  width: number;
   height: number;
 }
 
@@ -60,7 +61,9 @@ export class PrintLayer {
   onViewChange: () => void = () => {};
 
   private readonly device: GPUDevice;
-  private readonly placement: PrintPlacement;
+  private placement: PrintPlacement;
+  /** The image's size (texels) and whether there is one, as last written to the uniform. */
+  private image: [number, number, boolean] = [1, 1, false];
   private tex: GPUTexture;
   private raw: GPUTexture | null = null;
   private readonly layout: GPUBindGroupLayout;
@@ -80,8 +83,7 @@ export class PrintLayer {
     this.uniform = device.createBuffer({ label: 'printU', size: PRINT_U_BYTES, usage: UNIFORM });
     this.sampler = device.createSampler({ label: 'print', magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', maxAnisotropy: 16 });
     this.linear = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
-    this.tex = device.createTexture({ label: 'print.empty', size: [1, 1], format: 'rgba8unorm-srgb', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-    device.queue.writeTexture({ texture: this.tex }, new Uint8Array(4), { bytesPerRow: 4 }, [1, 1]);
+    this.tex = this.emptyTexture();
     this.view = this.tex.createView();
     this.modeU = device.createBuffer({ label: 'print.mode', size: 16, usage: UNIFORM });
     this.flags = device.createBuffer({ label: 'print.flags', size: 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
@@ -103,6 +105,30 @@ export class PrintLayer {
     this.prepPipe = pipe('fsPrep');
     this.downPipe = pipe('fsDown');
     this.writeUniform(1, 1, false);
+  }
+
+  /** A transparent texel: the texture bound while there is no print. */
+  private emptyTexture(): GPUTexture {
+    const tex = this.device.createTexture({ label: 'print.empty', size: [1, 1], format: 'rgba8unorm-srgb', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    this.device.queue.writeTexture({ texture: tex }, new Uint8Array(4), { bytesPerRow: 4 }, [1, 1]);
+    return tex;
+  }
+
+  /** No print: the cloth is drawn unprinted, and the print's textures are released. */
+  clear(): void {
+    this.writeUniform(1, 1, false);
+    const raw = this.raw;
+    if (!raw) return;
+    const old = this.tex;
+    this.raw = null;
+    this.tex = this.emptyTexture();
+    this.view = this.tex.createView();
+    this.onViewChange();
+    // frames in flight may still read them
+    void this.device.queue.onSubmittedWorkDone().then(() => {
+      raw.destroy();
+      old.destroy();
+    });
   }
 
   /** Take a new rendering of the design: upload it, convert it to ink coverage and filter its mips. */
@@ -160,16 +186,24 @@ export class PrintLayer {
       if (over) this.elementAlpha = 'straight';
       else if (partial) {
         this.elementAlpha = 'premultiplied';
-        // redo the snapshot that told us (the raw upload is still there, unless a newer one replaced it)
-        this.convert(true, false);
+        // redo the snapshot that told us (the raw upload is still there, unless a newer one replaced it
+        // or the print was removed)
+        if (this.raw) this.convert(true, false);
       }
     });
   }
 
+  /** Move the print on the cloth (the view's framing changed). */
+  setPlacement(placement: PrintPlacement): void {
+    this.placement = placement;
+    this.writeUniform(...this.image);
+  }
+
   private writeUniform(width: number, height: number, on: boolean): void {
+    this.image = [width, height, on];
     const P = this.placement;
+    const w = P.width;
     const h = P.height;
-    const w = (h * width) / height;
     const buf = new ArrayBuffer(PRINT_U_BYTES);
     new Float32Array(buf, 0, 4).set([P.center[0] - w / 2, P.center[1] + h / 2, 1 / w, 1 / h]);
     new Uint32Array(buf, 16, 4).set([P.layer, on ? 1 : 0, width, height]);

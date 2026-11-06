@@ -7,6 +7,7 @@
   --paper-dim: rgba(233, 235, 241, 0.62);
   --label: 'Oswald', 'Arial Narrow', 'Helvetica Neue', sans-serif;
   --gutter: clamp(16px, 2.4vw, 30px);
+  --top: max(var(--gutter), env(safe-area-inset-top));
   --right: max(var(--gutter), env(safe-area-inset-right));
   --bottom: max(var(--gutter), env(safe-area-inset-bottom));
 }
@@ -106,7 +107,7 @@ body:not(.loading) .loader {
   }
 }
 
-/* ------------------------------------------------------------------ dock: designs menu and reset */
+/* ------------------------------------------------------------------ dock: prints menu and reset */
 
 .dock {
   position: fixed;
@@ -125,7 +126,7 @@ body.loading .dock {
 
 .reset,
 .menu,
-.design {
+.print {
   position: relative;
   display: inline-flex;
   align-items: center;
@@ -160,8 +161,8 @@ body.loading .dock {
   padding: 0;
 }
 
-/* the menu: the designs stacked above its button */
-.designs {
+/* the menu: the prints stacked above its button */
+.prints {
   position: absolute;
   left: 0;
   bottom: calc(100% + 10px);
@@ -174,21 +175,22 @@ body.loading .dock {
   list-style: none;
 }
 
-.designs[hidden] {
+.menu[hidden],
+.prints[hidden] {
   display: none;
 }
 
-.design {
+.print {
   padding: 0 calc(20px - 0.24em) 0 20px;
   white-space: nowrap;
   animation: rise 260ms cubic-bezier(0.3, 0.7, 0.2, 1) both;
 }
 
-.design[aria-checked='true'] {
+.print[aria-checked='true'] {
   color: var(--paper);
 }
 
-.design[aria-checked='true']::before {
+.print[aria-checked='true']::before {
   border-color: var(--thread);
 }
 
@@ -202,7 +204,7 @@ body.loading .dock {
 /* stitched inner seam, like a patch */
 .reset::before,
 .menu::before,
-.design::before {
+.print::before {
   content: '';
   position: absolute;
   inset: 4px;
@@ -234,8 +236,8 @@ body.loading .dock {
 .menu:hover::before,
 .menu:focus-visible::before,
 .menu[aria-expanded='true']::before,
-.design:hover::before,
-.design:focus-visible::before {
+.print:hover::before,
+.print:focus-visible::before {
   border-color: var(--thread);
 }
 
@@ -251,20 +253,20 @@ body.loading .dock {
 .menu:hover,
 .menu:focus-visible,
 .menu[aria-expanded='true'],
-.design:hover,
-.design:focus-visible {
+.print:hover,
+.print:focus-visible {
   color: var(--paper);
   background: rgba(22, 27, 40, 0.72);
   border-color: rgba(233, 235, 241, 0.22);
 }
 
 .menu:active,
-.design:active {
+.print:active {
   transform: scale(0.97);
 }
 
 .menu:focus-visible,
-.design:focus-visible {
+.print:focus-visible {
   outline: 2px solid var(--thread);
   outline-offset: 3px;
 }
@@ -295,6 +297,48 @@ body.loading .dock {
   }
 }
 
+
+/* ------------------------------------------------------------------ interactive mode indicator */
+
+.interactive {
+  position: fixed;
+  top: var(--top);
+  right: var(--right);
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border: 1px solid rgba(233, 235, 241, 0.13);
+  border-radius: 999px;
+  background: rgba(13, 16, 25, 0.58);
+  -webkit-backdrop-filter: blur(12px) saturate(1.3);
+  backdrop-filter: blur(12px) saturate(1.3);
+  box-shadow:
+    0 10px 30px rgba(0, 0, 0, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  color: var(--paper);
+  pointer-events: none;
+  animation: rise 260ms cubic-bezier(0.3, 0.7, 0.2, 1) both;
+}
+
+.interactive[hidden] {
+  display: none;
+}
+
+.interactive::before {
+  content: '';
+  position: absolute;
+  inset: 4px;
+  border: 1px dashed var(--thread);
+  border-radius: inherit;
+}
+
+.interactive svg {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linejoin: round;
+}
 
 /* ------------------------------------------------------------------ status */
 
@@ -340,7 +384,8 @@ body.failed .status {
 @media (prefers-reduced-motion: reduce) {
   .loader-needle,
   .reset.spin svg,
-  .design {
+  .print,
+  .interactive {
     animation: none;
   }
   .reset:hover svg {

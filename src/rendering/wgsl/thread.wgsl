@@ -19,6 +19,19 @@
 // free tails of threads held at one end (thread_prep.wgsl tailSolve)
 @group(0) @binding(11) var<storage, read> tails: array<vec4<f32>>;
 @group(0) @binding(12) var overMap: texture_depth_2d;
+// the page the yarns are dyed with (render_common.wgsl PrintU)
+@group(0) @binding(13) var printTex: texture_2d<f32>;
+@group(0) @binding(14) var printSampler: sampler;
+@group(0) @binding(15) var<uniform> PRN: PrintU;
+
+// The dye of a freed yarn (fine index `yarn` of family `fam`, layer `layer`) at `c` crossings along
+// it: the page where that point of it lay in the weave, filtered to a footprint of `foot` metres.
+fn threadDye(layer: u32, fam: u32, yarn: u32, c: f32, foot: f32) -> vec3<f32> {
+  if (PRN.info.y != 1u || layer != PRN.info.x) { return UNDYED; }
+  let uv = select(vec2<f32>(c, f32(yarn)), vec2<f32>(f32(yarn), c), fam == 1u);
+  let rest = restOfUV(R.layers[layer], uv);
+  return dyeOf(textureSampleLevel(printTex, printSampler, printUV(PRN, rest), log2(max(foot * printDensity(PRN), 1.0))));
+}
 
 const CHUNK_PTS: u32 = THREAD_VERTS / 2u;
 const FIBER_PTS: u32 = FIBER_VERTS / 2u;
@@ -123,7 +136,8 @@ fn fsThread(in: VOut) -> @location(0) vec4<f32> {
   let pix = F.camPos.w * length(F.camPos.xyz - in.world);
   // a yarn freed from the weave is abraded and loosened: its pale core shows, more toward an
   // untwisting end
-  let look = yarnLook(LR, in.id.z, fam, yarn, i32(floor(in.c / f32(LR.twill.x))), along, s, min(1.0, 0.8 + 0.2 * in.tip), pix, 1.0);
+  let dye = threadDye(in.id.z, fam, in.id.x, in.c, pix);
+  let look = yarnLook(LR, in.id.z, fam, yarn, i32(floor(in.c / f32(LR.twill.x))), along, s, min(1.0, 0.8 + 0.2 * in.tip), pix, 1.0, dye);
   let tw = select(LR.weft.w, LR.warp.w, fam == 1u) * (1.0 - in.tip);
   let Tf = normalize(cos(tw) * T + sin(tw) * cross(N, T));
   let key = keyLight(in.world);
@@ -143,6 +157,8 @@ struct FOut {
   @location(2) alpha: f32,
   // unused, family, layer, seed
   @location(3) @interpolate(flat) id: vec4<u32>,
+  // the dye of the yarn the fibre came from (threadDye)
+  @location(4) @interpolate(flat) dye: vec3<f32>,
 };
 
 fn hiddenF() -> FOut {
@@ -196,7 +212,9 @@ fn vsThreadFuzz(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32
   let len = (0.15e-3 + 0.8e-3 * rl * rl) * (1.0 + 2.0 * splay);
   let bend = vec3<f32>(hashf(seed + 4u) - 0.5, hashf(seed + 5u) - 0.5, hashf(seed + 6u) - 0.8) * (0.9 * len);
   let wave = vec3<f32>(hashf(seed + 7u) - 0.5, hashf(seed + 8u) - 0.5, hashf(seed + 9u) - 0.5) * (0.3 * len);
-  return fibre(tp.p + radial * tp.radius, dir, len, bend, wave, 1.0 + 2.0 * hashf(seed + 10u), 25e-6, vi, u1, vec4<u32>(0u, ch.ri.fam, ch.ri.layer, seed));
+  var o = fibre(tp.p + radial * tp.radius, dir, len, bend, wave, 1.0 + 2.0 * hashf(seed + 10u), 25e-6, vi, u1, vec4<u32>(0u, ch.ri.fam, ch.ri.layer, seed));
+  o.dye = threadDye(ch.ri.layer, ch.ri.fam, ch.ri.yarn, p, F.camPos.w * length(F.camPos.xyz - tp.p));
+  return o;
 }
 
 @fragment
@@ -204,11 +222,9 @@ fn fsThreadFuzz(in: FOut) -> @location(0) vec4<f32> {
   let V = normalize(F.camPos.xyz - in.world);
   let T = normalize(in.tangent);
   let N = normalize(V - dot(V, T) * T);
-  // loose fibres are mostly the pale core and abraded surface fibres
+  // loose fibres are mostly the undyed core and abraded surface fibres, some still fully dyed
   let pale = hashf(in.id.w + 9u) < 0.75;
-  var albedo = vec3<f32>(0.40, 0.42, 0.47);
-  if (in.id.y == 0u) { albedo = vec3<f32>(0.44, 0.44, 0.43); }
-  if (!pale && in.id.y == 1u) { albedo = vec3<f32>(0.08, 0.12, 0.27); }
+  let albedo = select(mix(in.dye, UNDYED, 0.15), mix(in.dye, UNDYED, 0.6), pale);
   let key = keyLight(in.world);
   let sh = shadowFactor(in.world, N);
   var c = fiberShade(N, T, V, key.xyz, albedo, 0.2) * (key.w * sh) * F.keyColor.rgb + overShade(N, T, V, albedo, 0.2, in.world, N) + F.ambient.rgb * albedo;

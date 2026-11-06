@@ -10,8 +10,10 @@ export type ToEngine =
   | { type: 'visibility'; visible: boolean }
   /** Port to the audio thread's tear voice (audio/worklet.ts): acoustic records go there. */
   | { type: 'audio'; port: MessagePort }
-  /** A new rendering of the printed design (its snapshot or bitmap is transferred with the message). */
-  | { type: 'print'; source: PrintSource }
+  /** Where the page is under the pointer at CSS (x, y) of the canvas (answered by 'pagePoint'). */
+  | { type: 'pagePick'; seq: number; x: number; y: number }
+  /** A new rendering of the printed design (its snapshot is transferred with the message), or null: no print. */
+  | { type: 'print'; source: PrintSource | null }
   | DevCommand;
 
 /** Development-only commands (never sent by the product UI). */
@@ -40,7 +42,25 @@ export type FromEngine =
   | { type: 'progress'; value: number }
   | { type: 'cursor'; cursor: 'grab' | 'grabbing' | 'default' }
   | { type: 'stats'; stats: EngineStats }
-  | { type: 'devDone'; id: number; result?: unknown };
+  | { type: 'devDone'; id: number; result?: unknown }
+  /**
+   * The print's page size (CSS px): the cloth under the print as it is on screen; its snapshots are
+   * `texels` wide.
+   */
+  | { type: 'printFrame'; width: number; height: number; texels: number }
+  | { type: 'pagePoint'; seq: number; point: PagePoint | null }
+  /** The cloth started moving, or came to rest. */
+  | { type: 'motion'; moving: boolean };
+
+/**
+ * A point of the page on the cloth under the pointer: page CSS px (x, y), and how the screen point moves
+ * per page px there, canvas CSS px: j = [dx/dpageX, dy/dpageX, dx/dpageY, dy/dpageY].
+ */
+export interface PagePoint {
+  x: number;
+  y: number;
+  j: [number, number, number, number];
+}
 
 export interface EngineStats {
   frameMs: number;

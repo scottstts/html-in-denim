@@ -2,6 +2,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type { Plugin } from 'vite';
 import { defineConfig } from 'vitest/config';
+import { prints } from './plugins/prints.ts';
 
 /** Dev-only: accept PNG captures from the running app and store them under artifacts/captures. */
 function captureEndpoint(): Plugin {
@@ -30,8 +31,11 @@ export default defineConfig({
   server: {
       allowedHosts: true
   },
-  plugins: [captureEndpoint()],
+  plugins: [prints(), captureEndpoint()],
   worker: { format: 'es' },
+  // only the app's page: prints (public/prints) are served as they are and resolve their own imports
+  // (import maps, CDNs), which the dependency scan would try and fail to bundle
+  optimizeDeps: { entries: ['index.html'] },
   build: { target: 'es2023' },
   test: {
     include: ['tests/**/*.test.ts'],

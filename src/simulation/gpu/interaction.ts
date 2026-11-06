@@ -13,10 +13,22 @@ const SLOT_ENTRIES = 512;
 const SLOT_BYTES = 64;
 /** Proximity candidates (interact.wgsl MAX_CAND). */
 const MAX_CAND = 128;
-/** Words of the pick output: point, node, kind, then the connectivity window (interact.wgsl pickOut). */
-const PICK_OUT_WORDS = 8 + 256;
+/** Words of the pick output: point, node, kind, the connectivity window, the face under the pointer (interact.wgsl pickOut). */
+const PICK_OUT_WORDS = 8 + 256 + 8;
+/** Word offset of the face under the pointer in the pick output (interact.wgsl PAGE_OUT). */
+const PAGE_OUT = 8 + 256;
 /** Largest patch window radius one pickWindow workgroup covers ((2 R + 1)^2 <= 256). */
 const MAX_WINDOW_RADIUS = 7;
+
+/** The cloth under a pointer (Interaction.clothAt). */
+export interface ClothPoint {
+  layer: number;
+  /** Lattice coordinates: column, row (fractional within the cell). */
+  lattice: [number, number];
+  /** Drawing-buffer pixels the point moves on screen per lattice column and per lattice row there. */
+  perColumn: [number, number];
+  perRow: [number, number];
+}
 
 export interface PickResult {
   node: number;
@@ -59,6 +71,7 @@ export class Interaction {
   private readonly group: GPUBindGroup;
   private readonly pipes: Record<string, GPUComputePipeline> = {};
   private staging: GPUBuffer[] = [];
+  private pageStaging: GPUBuffer[] = [];
   private readonly held: (Held | null)[] = new Array<Held | null>(MAX_GRIPS).fill(null);
   /** Node -> slot holding it. */
   private readonly owner = new Map<number, number>();
@@ -72,7 +85,7 @@ export class Interaction {
     // without contact nothing else writes ext, so grip terms overwrite instead of accumulating
     const code = interactWgsl.replace('const GRIP_ADDS: bool = true;', `const GRIP_ADDS: bool = ${solver.contactEnabled};`);
     this.mod = new ComputeModule(device, 'interact', commonWgsl + code);
-    for (const e of ['gripTerms', 'gripLead', 'gripInit', 'pickRay', 'pickRayNode', 'pickCandidates', 'pickOcclude', 'pickVisible', 'pickWrite', 'pickWindow']) {
+    for (const e of ['gripTerms', 'gripLead', 'gripInit', 'pickRay', 'pickRayNode', 'pickCandidates', 'pickOcclude', 'pickVisible', 'pickWrite', 'pickWindow', 'pickFace']) {
       this.pipes[e] = this.mod.pipeline(e);
     }
     this.gripGoal = createBuffer(device, 'gripGoal', 48 * MAX_GRIPS);
@@ -116,6 +129,20 @@ export class Interaction {
    * no intact face hides. Material behind a front surface is never picked.
    */
   async pickAt(viewProj: Float32Array, px: number, py: number, width: number, height: number, radiusPx: number): Promise<PickResult | null> {
+    this.writeRay(viewProj, px, py, width, height, radiusPx);
+    const enc = this.device.createCommandEncoder({ label: 'pick' });
+    const pass = enc.beginComputePass();
+    const g = Math.ceil(this.solver.N / 128);
+    for (const e of ['pickRay', 'pickRayNode', 'pickCandidates', 'pickOcclude']) this.run(pass, e, g);
+    this.run(pass, 'pickVisible', Math.ceil(MAX_CAND / 128));
+    this.run(pass, 'pickWrite', 1);
+    this.run(pass, 'pickWindow', 1);
+    pass.end();
+    return this.readPick(enc);
+  }
+
+  /** The pointer ray through a drawing-buffer pixel, and the pick's accumulators reset. */
+  private writeRay(viewProj: Float32Array, px: number, py: number, width: number, height: number, radiusPx: number): void {
     const inv = invert(viewProj);
     const nx = (px / width) * 2 - 1;
     const ny = 1 - (py / height) * 2;
@@ -133,15 +160,34 @@ export class Interaction {
     const init = new Uint32Array(4 + 2 * MAX_CAND);
     init.set([0xffffffff, 0xffffffff, 0, 0xffffffff]);
     this.device.queue.writeBuffer(this.pick, 0, init);
-    const enc = this.device.createCommandEncoder({ label: 'pick' });
+  }
+
+  /**
+   * The cloth under a drawing-buffer pixel: the nearest surface along the pointer ray, if it is an
+   * intact face (not a strand over an opening). Its layer, lattice coordinates (column, row; fractional
+   * within the cell) and how the pixel moves per lattice unit there (drawing-buffer px per column, per
+   * row).
+   */
+  async clothAt(viewProj: Float32Array, px: number, py: number, width: number, height: number): Promise<ClothPoint | null> {
+    this.writeRay(viewProj, px, py, width, height, 0);
+    this.device.queue.writeBuffer(this.pickOut, 4 * PAGE_OUT, new Uint32Array([0xffffffff]));
+    const enc = this.device.createCommandEncoder({ label: 'clothAt' });
     const pass = enc.beginComputePass();
     const g = Math.ceil(this.solver.N / 128);
-    for (const e of ['pickRay', 'pickRayNode', 'pickCandidates', 'pickOcclude']) this.run(pass, e, g);
-    this.run(pass, 'pickVisible', Math.ceil(MAX_CAND / 128));
-    this.run(pass, 'pickWrite', 1);
-    this.run(pass, 'pickWindow', 1);
+    this.run(pass, 'pickRay', g);
+    this.run(pass, 'pickFace', g);
     pass.end();
-    return this.readPick(enc);
+    const staging = this.pageStaging.pop() ?? this.device.createBuffer({ size: 32, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    enc.copyBufferToBuffer(this.pickOut, 4 * PAGE_OUT, staging, 0, 32);
+    this.device.queue.submit([enc.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const out = staging.getMappedRange().slice(0);
+    staging.unmap();
+    this.pageStaging.push(staging);
+    const w = new Uint32Array(out);
+    if (w[0] === 0xffffffff) return null;
+    const f = new Float32Array(out);
+    return { layer: w[0], lattice: [f[1], f[2]], perColumn: [f[3], f[4]], perRow: [f[5], f[6]] };
   }
 
   private async readPick(enc: GPUCommandEncoder): Promise<PickResult | null> {

@@ -12,7 +12,8 @@
 // toward the camera in slot order and are drawn in that order (back to front within a crossing). They
 // are lit per vertex: through the fringe's fibre between them and the key (single scattering) and by
 // light diffusing through it (multiple scattering, damped by the fibre's absorption, so the depth of
-// an indigo fringe darkens toward blue).
+// a dyed fringe deepens toward its dye). Fibre is dyed with the page where its yarn lay (render_common
+// dyeOf), in its sheath.
 
 @group(0) @binding(0) var<uniform> F: FrameU;
 @group(0) @binding(1) var<uniform> R: RenderU;
@@ -22,6 +23,10 @@
 @group(0) @binding(9) var shadowMap: texture_depth_2d;
 @group(0) @binding(10) var shadowSampler: sampler_comparison;
 @group(0) @binding(11) var overMap: texture_depth_2d;
+// the page the yarns are dyed with (render_common.wgsl PrintU)
+@group(0) @binding(12) var printTex: texture_2d<f32>;
+@group(0) @binding(13) var printSampler: sampler;
+@group(0) @binding(14) var<uniform> PRN: PrintU;
 
 const FIBER_PTS: u32 = FIBER_VERTS / 2u;
 // strands per open side (FIBERS_PER_EDGE are dealt round a crossing's open sides)
@@ -32,9 +37,9 @@ const FIBRE_W: f32 = 16e-6;
 // the twist presses the core fibres hardest, so the outer (sheath) fibres slip far more often
 const SLIP_SHEATH: f32 = 0.8;
 const SLIP_CORE: f32 = 0.3;
-// fraction of a ring-dyed warp's fibre carrying indigo: its sheath (dye penetrates ~30% of the radius)
+// fraction of a ring-dyed yarn's fibre carrying dye: its sheath (dye penetrates ~30% of the radius)
 const RING_DYED: f32 = 0.5;
-// the protruding fraction of a broken yarn's fibre, and the dyed share of a warp's protruding fibre
+// the protruding fraction of a broken yarn's fibre, and the dyed share of its protruding fibre
 const FRAY_PROTRUDE: f32 = RING_DYED * SLIP_SHEATH + (1.0 - RING_DYED) * SLIP_CORE;
 const FRAY_DYED: f32 = RING_DYED * SLIP_SHEATH / FRAY_PROTRUDE;
 // mean length by which they protrude (cotton staple is ~25 mm, but abraded fibre is broken short and
@@ -42,7 +47,7 @@ const FRAY_DYED: f32 = RING_DYED * SLIP_SHEATH / FRAY_PROTRUDE;
 const FRAY_LEN: f32 = 1.5e-3;
 // hair shed by a loosened yarn along the edge, as fibre length per length of yarn (Uster H of an
 // abraded, untwisted coarse yarn), the band of such yarns behind the edge, the hairs' mean length,
-// and their dyed share on a warp (hair is its surface fibre: the dyed sheath)
+// and their dyed share (hair is a yarn's surface fibre: the dyed sheath)
 const RIM_HAIR: f32 = 10.0;
 const RIM_BAND: f32 = 1.5e-3;
 const RIM_HAIR_LEN: f32 = 0.9e-3;
@@ -60,21 +65,20 @@ const CRIMP_MAX: f32 = 1.2e-3;
 const CURL: f32 = 0.15;
 const CURL_MIN: f32 = 2.0e-3;
 const CURL_MAX: f32 = 6.0e-3;
-// single-scattering albedo of a cotton fibre, from the woven material's reflectances (yarnLook): a
-// deep mass of fibre of albedo w reflects R = (1 - s) / (1 + s), s = sqrt(1 - w). Indigo-dyed (the
-// dyed yarn surface, ~(0.054, 0.078, 0.16)), undyed warp core (0.6, 0.62, 0.66), loose weft
-// (0.64, 0.61, 0.55).
-const DYED_FIBRE: vec3<f32> = vec3<f32>(0.195, 0.27, 0.476);
-const CORE_FIBRE: vec3<f32> = vec3<f32>(0.938, 0.945, 0.958);
-const WEFT_FIBRE: vec3<f32> = vec3<f32>(0.952, 0.941, 0.916);
+// single-scattering albedo of a cotton fibre from the reflectance R of a deep mass of it (yarnLook): R =
+// (1 - s) / (1 + s), s = sqrt(1 - w). Undyed cotton (render_common UNDYED) gives UNDYED_FIBRE.
+fn fibreAlbedo(R: vec3<f32>) -> vec3<f32> {
+  let s = (vec3<f32>(1.0) - R) / (vec3<f32>(1.0) + R);
+  return vec3<f32>(1.0) - s * s;
+}
+const UNDYED_FIBRE: vec3<f32> = vec3<f32>(0.952, 0.941, 0.916);
 
 struct VOut {
   @builtin(position) pos: vec4<f32>,
   @location(0) world: vec3<f32>,
   // coverage of a compact yarn end (its width over the drawn width)
   @location(2) alpha: f32,
-  // kind (0 fan of an end's fibre, 1 yarn end, 2 rim hair), its undyed fibre (0 warp core, 2 weft),
-  // layer, seed
+  // kind (0 fan of an end's fibre, 1 yarn end, 2 rim hair), unused, layer, seed
   @location(3) @interpolate(flat) id: vec4<u32>,
   // 0 at the root .. 1 at the tip
   @location(4) along: f32,
@@ -92,6 +96,8 @@ struct VOut {
   @location(6) lat: vec2<f32>,
   // fibres in the sheet, root half width (m), length (m), fraction dyed
   @location(7) @interpolate(flat) sheet: vec4<f32>,
+  // single-scattering albedo of its dyed fibre
+  @location(12) @interpolate(flat) dyedA: vec3<f32>,
 };
 
 fn hidden() -> VOut {
@@ -155,13 +161,13 @@ fn fibreLight(key: vec4<f32>, over: vec4<f32>, T: vec3<f32>, V: vec3<f32>, Nc: v
 }
 
 // What a strand is made of: fibres in it (0: a compact yarn end), its root width (m), how far its
-// fibres diverge (half-angle tangent), its dyed fraction and its undyed fibre (0 warp core, 2 weft).
+// fibres diverge (half-angle tangent), its dyed fraction and the dyed yarn surface's reflectance.
 struct Make {
   n: f32,
   w0: f32,
   fan: f32,
   dyed: f32,
-  undyed: u32,
+  dye: vec3<f32>,
 };
 
 // Vertex vi of a strand from `root` along unit `dir` over `len`, bent by `bend` (tip offset growing
@@ -206,16 +212,17 @@ fn strand(root: vec3<f32>, dir: vec3<f32>, len: f32, bend: vec3<f32>, wave: vec3
   let tau0 = tauEnd * endReach(x) + tauRim * rim;
   let tau = up * tau0;
   let tauO = select(h, 1.0 - h, dot(N, F.overDir.xyz) > 0.0) * tau0;
-  let undyed = select(WEFT_FIBRE, CORE_FIBRE, m.undyed == 0u);
+  let dyedA = fibreAlbedo(m.dye);
+  o.dyedA = dyedA;
   o.keyAcross = dot(normalize(F.keyPos.xyz - P), B) * sideSign;
   let key = fibreKey(P, dP, V);
   let over = fibreOver(P, dP, V);
   if (m.n > 0.0) {
-    let u = fibreLight(key, over, dP, V, N, undyed, tau, tauO);
+    let u = fibreLight(key, over, dP, V, N, UNDYED_FIBRE, tau, tauO);
     o.litU = u.single;
     o.msU = u.multi;
     if (m.dyed > 0.0) {
-      let d = fibreLight(key, over, dP, V, N, DYED_FIBRE, tau, tauO);
+      let d = fibreLight(key, over, dP, V, N, dyedA, tau, tauO);
       o.litD = d.single;
       o.msD = d.multi;
     } else {
@@ -223,8 +230,8 @@ fn strand(root: vec3<f32>, dir: vec3<f32>, len: f32, bend: vec3<f32>, wave: vec3
       o.msD = u.multi;
     }
   } else {
-    // the compact yarn end: a warp shows its dyed surface, paling as it untwists toward the fans
-    let a = select(WEFT_FIBRE, mix(vec3<f32>(0.054, 0.078, 0.16), mix(DYED_FIBRE, CORE_FIBRE, 0.5), t * t), m.undyed == 0u);
+    // the compact yarn end shows its dyed surface, paling as it untwists toward the fans
+    let a = mix(m.dye, mix(dyedA, UNDYED_FIBRE, 0.5), t * t);
     let e = fibreLight(key, over, dP, V, N, a, tau, tauO);
     o.litU = e.single + e.multi;
   }
@@ -267,6 +274,13 @@ fn vsEdgeFuzz(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) 
   let restC = vec2<f32>(f32((c - FL.x) % FL.y) * LR.pitch.x, f32((c - FL.x) / FL.y) * LR.pitch.y);
   let tuftN = 0.6 * noise2(6007u + l, restC / 5.0e-3) + 0.4 * noise2(6011u + l, restC / 1.6e-3);
   let density = 0.3 + 1.4 * smoothstep(-0.45, 0.5, tuftN);
+  // the dye of the yarns here: the page at this crossing, at about the fringe's pixel footprint
+  var dye = UNDYED;
+  if (PRN.info.y == 1u && l == PRN.info.x) {
+    let restK = restOfUV(LR, vec2<f32>(f32((c - FL.x) % FL.y), f32((c - FL.x) / FL.y)));
+    let foot = F.camPos.w * length(F.camPos.xyz - root0.xyz);
+    dye = dyeOf(textureSampleLevel(printTex, printSampler, printUV(PRN, restK), log2(max(foot * printDensity(PRN), 1.0))));
+  }
   let dU = edgeRoots[3u * ei + 1u].xyz;
   let dV = edgeRoots[3u * ei + 2u].xyz;
   var N = normalize(cross(dU, dV));
@@ -281,7 +295,6 @@ fn vsEdgeFuzz(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) 
   // the yarn running across the side ends here (picks across the u sides, warps across the v sides);
   // the yarns along it are the loosened rim
   let fam = select(1u, 0u, side < 2u);
-  let famAlong = 1u - fam;
   // side length along the edge: the spacing of the yarns that end across it
   let sideLen = select(LR.pitch.y, LR.pitch.x, fam == 1u);
   let endHere = yarnCode(fieldY[c], fam) < PULLED_R;
@@ -309,15 +322,15 @@ fn vsEdgeFuzz(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) 
     if (m.n < 0.05) { return hidden(); }
     m.w0 = 0.2e-3;
     m.fan = FAN_CONE;
-    m.dyed = select(0.0, RIM_DYED, famAlong == 1u);
-    m.undyed = select(2u, 0u, famAlong == 1u);
+    m.dyed = RIM_DYED;
+    m.dye = dye;
     let back = (0.2e-3 + RIM_BAND * pow(hashf(seed + 17u), 1.5)) / pitchOut;
     let root = atSide - (dU * outR.x + dV * outR.y) * back;
     let spread = (hashf(seed + 3u) - 0.5) * 1.2;
     let dir = normalize(outW + acrossW * spread + N * (0.03 + 0.12 * h));
     let len = back * pitchOut + clamp(-2.0 * RIM_HAIR_LEN * log(1.0 - 0.95 * hashf(seed + 5u)), 0.2e-3, 4.0e-3);
     let bend = cv * (0.7 * len) - N * (0.1 * len);
-    return strand(root + N * 0.06e-3, dir, len, bend, wv * (0.4 * len), 2.0 + 4.0 * hashf(seed + 16u), m, vi, acrossW, N, outW, -back * pitchOut, tauEnd, tauRim, h, vec4<u32>(2u, m.undyed, l, seed));
+    return strand(root + N * 0.06e-3, dir, len, bend, wv * (0.4 * len), 2.0 + 4.0 * hashf(seed + 16u), m, vi, acrossW, N, outW, -back * pitchOut, tauEnd, tauRim, h, vec4<u32>(2u, 0u, l, seed));
   }
   if (!endHere) { return hidden(); }
   // the yarn end standing out of the edge, untwisting from part-way along it; its fans splay from
@@ -333,21 +346,21 @@ fn vsEdgeFuzz(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) 
   let t0 = 0.15 + 0.3 * hashf(sb + 9u);
   let yarnD = 2.0 * select(LR.loose.y, LR.loose.x, fam == 0u);
   var m: Make;
-  m.undyed = select(2u, 0u, fam == 1u);
+  m.dye = dye;
   if (j == nRim) {
     m.n = 0.0;
     m.w0 = yarnD;
     m.fan = 0.0;
     m.dyed = 0.0;
-    return strand(atEnd, dirB, lenB * t0, (droopB + curlB) * (t0 * t0), curlB * 0.2, 1.0, m, vi, acrossW, N, outW, 0.0, tauEnd, tauRim, h, vec4<u32>(1u, m.undyed, l, sb));
+    return strand(atEnd, dirB, lenB * t0, (droopB + curlB) * (t0 * t0), curlB * 0.2, 1.0, m, vi, acrossW, N, outW, 0.0, tauEnd, tauRim, h, vec4<u32>(1u, 0u, l, sb));
   }
-  // a fan of the end's protruding fibre (its share of them; a warp's mostly from the dyed sheath, a
-  // weft's undyed throughout), from where the twist opened, splaying and drooping over the opening;
+  // a fan of the end's protruding fibre (its share of them, mostly from the dyed sheath), from where
+  // the twist opened, splaying and drooping over the opening;
   // fans rise from the end's own direction toward the camera
   m.n = endFibres / f32(nFan);
   m.w0 = yarnD;
   m.fan = FAN_CONE;
-  m.dyed = select(0.0, FRAY_DYED, fam == 1u);
+  m.dyed = FRAY_DYED;
   let tip = atEnd + dirB * (lenB * t0) + (droopB + curlB) * (t0 * t0);
   let tangent = normalize(dirB * lenB + (droopB + curlB) * (2.0 * t0));
   let k = f32(j - nRim - 1u) / max(f32(nFan) - 1.0, 1.0);
@@ -358,7 +371,7 @@ fn vsEdgeFuzz(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) 
   let len = clamp(-2.0 * FRAY_LEN * log(1.0 - 0.98 * hashf(seed + 6u)), 0.4e-3, 4.0 * FRAY_LEN);
   let droop = clamp(len / 1.5e-3, 0.0, 1.0);
   let bend = cv * (0.8 * len) - N * (0.4 * len * droop) + vec3<f32>(0.0, 0.0, -0.3 * len * droop);
-  return strand(tip, dir, len, bend, wv * (0.3 * len), 1.5 + 2.5 * hashf(seed + 16u), m, vi, acrossW, N, outW, lenB * t0 * dot(dirB, outW), tauEnd, tauRim, h, vec4<u32>(0u, m.undyed, l, seed));
+  return strand(tip, dir, len, bend, wv * (0.3 * len), 1.5 + 2.5 * hashf(seed + 16u), m, vi, acrossW, N, outW, lenB * t0 * dot(dirB, outW), tauEnd, tauRim, h, vec4<u32>(0u, 0u, l, seed));
 }
 
 // A smooth wave of period 1 between -1 and 1 (a parabola per half period: within 0.06 of a sine).
@@ -442,8 +455,7 @@ fn fsFuzz(in: VOut) -> @location(0) vec4<f32> {
   let across = in.sheet.x * (1.0 - in.along) * FIBRE_W / (2.0 * half);
   let s = clamp(0.5 - 0.5 * sign(in.keyAcross) * in.lat.x / half, 0.0, 1.0);
   let tauX = across * mix(0.5, s, abs(in.keyAcross));
-  let undyed = select(WEFT_FIBRE, CORE_FIBRE, in.id.y == 0u);
-  let cu = in.litU * exp(-tauX) + in.msU * exp(-diffusion(undyed) * tauX);
-  let cd = in.litD * exp(-tauX) + in.msD * exp(-diffusion(DYED_FIBRE) * tauX);
+  let cu = in.litU * exp(-tauX) + in.msU * exp(-diffusion(UNDYED_FIBRE) * tauX);
+  let cd = in.litD * exp(-tauX) + in.msD * exp(-diffusion(in.dyedA) * tauX);
   return vec4<f32>(mix(cu, cd, cov.y), cov.x);
 }

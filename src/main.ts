@@ -2,8 +2,10 @@ import './style.css';
 import { TearAudio } from './audio/audio';
 import { computeDrawingBufferSize } from './shared/drawingBuffer';
 import { mountPrint } from './print/bridge';
-import { DESIGNS, type DesignEntry } from './print/designs';
-import { ALL_POINTERS, type FromEngine, type ToEngine } from './shared/messages';
+import type { PrintEntry } from './print/catalog';
+import { PageInput } from './print/interactive';
+import { PRINTS } from 'virtual:prints';
+import { ALL_POINTERS, type FromEngine, type PagePoint, type ToEngine } from './shared/messages';
 
 const canvas = document.createElement('canvas');
 canvas.className = 'fabric';
@@ -13,7 +15,8 @@ const status = document.querySelector<HTMLElement>('.status')!;
 const reset = document.querySelector<HTMLButtonElement>('.reset')!;
 const loader = document.querySelector<HTMLElement>('.loader')!;
 const menu = document.querySelector<HTMLButtonElement>('.menu')!;
-const list = document.querySelector<HTMLElement>('.designs')!;
+const list = document.querySelector<HTMLElement>('.prints')!;
+const badge = document.querySelector<HTMLElement>('.interactive')!;
 
 function fail(message: string): void {
   status.textContent = message;
@@ -39,10 +42,46 @@ function size() {
   return { width, height, cssWidth, cssHeight };
 }
 
-// the printed design: HTML laid out inside the cloth canvas, its renderings sent to the engine
-const print = mountPrint(canvas, (source, transfer) => post({ type: 'print', source }, transfer));
-let shown = DESIGNS[0];
-print.show(shown);
+// the prints: HTML pages (public/prints) laid out inside the cloth canvas, their renderings sent to
+// the engine; the menu lists them, the first is printed at start
+const print = mountPrint(canvas, (source, transfer) => post({ type: 'print', source }, transfer), onKey);
+
+// interactive mode (I toggles it): the page takes the mouse and keyboard, the cloth none of it; where
+// the pointer is on the page comes from the engine (the cloth under it, as it is now)
+const picks = new Map<number, (p: PagePoint | null) => void>();
+let pickSeq = 0;
+const pickPage = (x: number, y: number) =>
+  new Promise<PagePoint | null>((resolve) => {
+    const s = pickSeq++;
+    picks.set(s, resolve);
+    post({ type: 'pagePick', seq: s, x, y });
+  });
+/** The cursor the engine asks for over the cloth (grab, grabbing). */
+let clothCursor = 'grab';
+const input = new PageInput(print, pickPage, (on) => {
+  badge.hidden = !on;
+  canvas.style.cursor = on ? 'default' : clothCursor;
+  // the cloth lets go of whatever it held
+  if (on) cancelAll(performance.now());
+});
+window.addEventListener('pointermove', (e) => input.pointerAt(e.clientX, e.clientY), { capture: true, passive: true });
+let prints: readonly PrintEntry[] = PRINTS;
+/** Id of the print on the cloth (null: none). */
+let shown: string | null = null;
+renderMenu();
+showPrint(prints[0]);
+if (import.meta.hot) {
+  // dev: prints dropped in or removed appear in the menu; an edited print is printed again
+  import.meta.hot.on('prints:list', (next: PrintEntry[]) => {
+    prints = next;
+    renderMenu();
+    if (!prints.some((p) => p.id === shown)) showPrint(prints[0]);
+  });
+  import.meta.hot.on('prints:change', () => {
+    const entry = prints.find((p) => p.id === shown);
+    if (entry) print.show(entry.url, entry.id);
+  });
+}
 
 const offscreen = canvas.transferControlToOffscreen();
 post({ type: 'init', canvas: offscreen, ...size() }, [offscreen]);
@@ -70,13 +109,15 @@ function pointer(phase: 'down' | 'move' | 'up' | 'cancel', e: PointerEvent) {
 function cancelAll(time: number) {
   post({ type: 'pointer', phase: 'cancel', id: ALL_POINTERS, seq: seq++, time: clock(time), x: 0, y: 0 });
 }
+// in interactive mode the cloth takes no input (where the page is under the pointer, the page has it)
 canvas.addEventListener('pointerdown', (e) => {
-  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  if (input.active || (e.pointerType === 'mouse' && e.button !== 0)) return;
   audio.unlock();
   canvas.setPointerCapture(e.pointerId);
   pointer('down', e);
 });
 canvas.addEventListener('pointermove', (e) => {
+  if (input.active) return;
   // the engine follows the pointer's path at substep resolution: coalesced samples carry it
   const samples = e.getCoalescedEvents?.() ?? [];
   if (samples.length === 0) pointer('move', e);
@@ -85,7 +126,7 @@ canvas.addEventListener('pointermove', (e) => {
 canvas.addEventListener('pointerup', (e) => {
   // iOS counts the end of a touch, not its start, as the gesture that may start audio
   audio.unlock();
-  pointer('up', e);
+  if (!input.active) pointer('up', e);
 });
 canvas.addEventListener('pointercancel', (e) => pointer('cancel', e));
 canvas.addEventListener('lostpointercapture', (e) => pointer('cancel', e));
@@ -93,54 +134,83 @@ canvas.addEventListener(
   'wheel',
   (e) => {
     e.preventDefault();
-    post({ type: 'wheel', seq: seq++, deltaY: e.deltaY, time: clock(e.timeStamp) });
+    if (!input.active) post({ type: 'wheel', seq: seq++, deltaY: e.deltaY, time: clock(e.timeStamp) });
   },
   { passive: false },
 );
-window.addEventListener('keydown', (e) => {
-  if (e.key !== 'Escape') return;
-  if (menuOpen()) {
-    openMenu(false);
-    menu.focus();
+// also the print page's keys, before the page has them (the keyboard is in the page in interactive mode)
+function onKey(e: KeyboardEvent) {
+  if (e.key === 'Escape') {
+    if (menuOpen()) {
+      openMenu(false);
+      menu.focus();
+    }
+    // a print page's event times are on its own clock
+    cancelAll(e.view === window ? e.timeStamp : performance.now());
+    return;
   }
-  cancelAll(e.timeStamp);
-});
+  // I toggles interactive mode, except where it is being typed into a field of the page
+  if ((e.key === 'i' || e.key === 'I') && !e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey && !typing(e.target)) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    input.set(!input.active);
+  }
+}
+/** A text field has the keyboard (of the app or of the page: elements of another realm, so no instanceof). */
+function typing(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el || typeof el.tagName !== 'string') return false;
+  if (el.isContentEditable || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') return true;
+  return el.tagName === 'INPUT' && !['button', 'checkbox', 'color', 'file', 'image', 'radio', 'range', 'reset', 'submit'].includes((el as HTMLInputElement).type);
+}
+window.addEventListener('keydown', onKey);
 window.addEventListener('blur', () => cancelAll(performance.now()));
 document.addEventListener('visibilitychange', () => {
   const visible = document.visibilityState === 'visible';
   post({ type: 'visibility', visible });
   audio.setVisible(visible);
 });
-// the designs menu: one item per premade design; choosing one prints it on the cloth as it is
-const menuOpen = () => !list.hasAttribute('hidden');
+// the prints menu: one item per print; choosing one prints it on the cloth as it is (no reset)
+function menuOpen() {
+  return !list.hasAttribute('hidden');
+}
 function openMenu(open: boolean) {
   list.hidden = !open;
   menu.setAttribute('aria-expanded', String(open));
 }
-const items = DESIGNS.map((entry) => {
-  const li = document.createElement('li');
-  li.setAttribute('role', 'none');
-  const item = document.createElement('button');
-  item.className = 'design';
-  item.type = 'button';
-  item.setAttribute('role', 'menuitemradio');
-  item.textContent = entry.label;
-  item.addEventListener('click', () => {
-    choose(entry);
-    openMenu(false);
-  });
-  li.append(item);
-  list.append(li);
-  return { entry, item };
-});
-const check = () => items.forEach((i) => i.item.setAttribute('aria-checked', String(i.entry === shown)));
-function choose(entry: DesignEntry) {
-  if (entry === shown) return;
-  shown = entry;
-  check();
-  print.show(entry);
+function renderMenu() {
+  list.replaceChildren(
+    ...prints.map((entry) => {
+      const li = document.createElement('li');
+      li.setAttribute('role', 'none');
+      const item = document.createElement('button');
+      item.className = 'print';
+      item.type = 'button';
+      item.setAttribute('role', 'menuitemradio');
+      item.dataset.print = entry.id;
+      item.textContent = entry.id;
+      item.addEventListener('click', () => {
+        if (entry.id !== shown) showPrint(entry);
+        openMenu(false);
+      });
+      li.append(item);
+      return li;
+    }),
+  );
+  // nothing to choose from where prints cannot reach the cloth
+  menu.hidden = !print.supported || prints.length === 0;
+  if (menu.hidden) openMenu(false);
+  checkMenu();
 }
-check();
+function checkMenu() {
+  for (const item of list.querySelectorAll<HTMLElement>('.print')) item.setAttribute('aria-checked', String(item.dataset.print === shown));
+}
+function showPrint(entry: PrintEntry | undefined) {
+  shown = entry?.id ?? null;
+  if (entry) print.show(entry.url, entry.id);
+  else print.clear();
+  checkMenu();
+}
 menu.addEventListener('click', () => openMenu(!menuOpen()));
 document.addEventListener('pointerdown', (e) => {
   if (menuOpen() && !(e.target instanceof Node && (list.contains(e.target) || menu.contains(e.target)))) openMenu(false);
@@ -170,6 +240,7 @@ if (import.meta.env.DEV) {
     ready: () => engineReady,
     step: (substeps: number) => call({ op: 'step', substeps }),
     camera: (c: Record<string, unknown>) => call({ op: 'camera', ...c }),
+    pagePick: pickPage,
   };
 }
 
@@ -189,8 +260,16 @@ worker.onmessage = (ev: MessageEvent<FromEngine>) => {
     }
     document.body.classList.toggle('loading', m.state === 'loading');
     if (m.state === 'running') markReady();
+  } else if (m.type === 'printFrame') {
+    print.setFrame(m.width, m.height, m.texels);
+  } else if (m.type === 'pagePoint') {
+    picks.get(m.seq)?.(m.point);
+    picks.delete(m.seq);
+  } else if (m.type === 'motion') {
+    input.setMoving(m.moving);
   } else if (m.type === 'cursor') {
-    canvas.style.cursor = m.cursor;
+    clothCursor = m.cursor;
+    if (!input.active) canvas.style.cursor = m.cursor;
   } else if (m.type === 'stats') {
     (window as unknown as { __fabricStats?: unknown }).__fabricStats = m.stats;
   }
