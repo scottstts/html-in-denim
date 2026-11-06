@@ -1,0 +1,349 @@
+:root {
+  --ink: #020203;
+  /* copper topstitch thread and the off-white of the selvedge */
+  --thread: #c9883f;
+  --thread-dim: rgba(201, 136, 63, 0.5);
+  --paper: #e9ebf1;
+  --paper-dim: rgba(233, 235, 241, 0.62);
+  --label: 'Oswald', 'Arial Narrow', 'Helvetica Neue', sans-serif;
+  --gutter: clamp(16px, 2.4vw, 30px);
+  --right: max(var(--gutter), env(safe-area-inset-right));
+  --bottom: max(var(--gutter), env(safe-area-inset-bottom));
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--ink);
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.fabric {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  display: block;
+  touch-action: none;
+  cursor: default;
+  transition: opacity 700ms ease;
+}
+
+body.loading .fabric {
+  opacity: 0;
+}
+
+/* ------------------------------------------------------------------ loader: a seam sewing itself */
+
+.loader {
+  --p: 0;
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  width: clamp(150px, 34vw, 240px);
+  height: 18px;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  transition:
+    opacity 500ms ease,
+    visibility 0s linear 500ms;
+}
+
+body:not(.loading) .loader {
+  opacity: 0;
+  visibility: hidden;
+}
+
+.loader-rows {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 5px;
+  height: 8px;
+  background:
+    repeating-linear-gradient(90deg, currentColor 0 7px, transparent 7px 12px) 0 0 / 100% 2px no-repeat,
+    repeating-linear-gradient(90deg, currentColor 0 7px, transparent 7px 12px) 6px 100% / 100% 2px no-repeat;
+}
+
+.loader-track {
+  color: rgba(233, 235, 241, 0.12);
+}
+
+.loader-fill {
+  color: var(--thread);
+  clip-path: inset(0 calc((1 - var(--p)) * 100%) 0 0);
+  transition: clip-path 600ms cubic-bezier(0.3, 0.7, 0.2, 1);
+}
+
+/* the needle at the seam's end, going through the cloth */
+.loader-needle {
+  position: absolute;
+  top: 0;
+  left: calc(var(--p) * 100%);
+  width: 1.5px;
+  height: 18px;
+  margin-left: -0.75px;
+  border-radius: 1px;
+  background: linear-gradient(var(--paper), rgba(233, 235, 241, 0.25));
+  transition: left 600ms cubic-bezier(0.3, 0.7, 0.2, 1);
+  animation: needle 900ms ease-in-out infinite;
+}
+
+@keyframes needle {
+  0%,
+  100% {
+    transform: translateY(-3px);
+    opacity: 0.95;
+  }
+  50% {
+    transform: translateY(3px);
+    opacity: 0.55;
+  }
+}
+
+/* ------------------------------------------------------------------ dock: designs menu and reset */
+
+.dock {
+  position: fixed;
+  right: var(--right);
+  bottom: var(--bottom);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  transition: opacity 600ms ease;
+}
+
+body.loading .dock {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.reset,
+.menu,
+.design {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  height: 44px;
+  padding: 0 calc(20px - 0.24em) 0 16px;
+  border: 1px solid rgba(233, 235, 241, 0.13);
+  border-radius: 999px;
+  background: rgba(13, 16, 25, 0.58);
+  -webkit-backdrop-filter: blur(12px) saturate(1.3);
+  backdrop-filter: blur(12px) saturate(1.3);
+  box-shadow:
+    0 10px 30px rgba(0, 0, 0, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  color: var(--paper-dim);
+  font: 600 13px/1 var(--label);
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition:
+    color 200ms ease,
+    background 200ms ease,
+    border-color 200ms ease,
+    transform 120ms ease,
+    opacity 600ms ease;
+}
+
+.menu {
+  justify-content: center;
+  width: 44px;
+  padding: 0;
+}
+
+/* the menu: the designs stacked above its button */
+.designs {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 10px);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.designs[hidden] {
+  display: none;
+}
+
+.design {
+  padding: 0 calc(20px - 0.24em) 0 20px;
+  white-space: nowrap;
+  animation: rise 260ms cubic-bezier(0.3, 0.7, 0.2, 1) both;
+}
+
+.design[aria-checked='true'] {
+  color: var(--paper);
+}
+
+.design[aria-checked='true']::before {
+  border-color: var(--thread);
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+/* stitched inner seam, like a patch */
+.reset::before,
+.menu::before,
+.design::before {
+  content: '';
+  position: absolute;
+  inset: 4px;
+  border: 1px dashed var(--thread-dim);
+  border-radius: inherit;
+  pointer-events: none;
+  transition: border-color 200ms ease;
+}
+
+.reset svg {
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 500ms cubic-bezier(0.3, 0.7, 0.2, 1);
+}
+
+.reset:hover,
+.reset:focus-visible {
+  color: var(--paper);
+  background: rgba(22, 27, 40, 0.72);
+  border-color: rgba(233, 235, 241, 0.22);
+}
+
+.reset:hover::before,
+.reset:focus-visible::before,
+.menu:hover::before,
+.menu:focus-visible::before,
+.menu[aria-expanded='true']::before,
+.design:hover::before,
+.design:focus-visible::before {
+  border-color: var(--thread);
+}
+
+.menu svg {
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.menu:hover,
+.menu:focus-visible,
+.menu[aria-expanded='true'],
+.design:hover,
+.design:focus-visible {
+  color: var(--paper);
+  background: rgba(22, 27, 40, 0.72);
+  border-color: rgba(233, 235, 241, 0.22);
+}
+
+.menu:active,
+.design:active {
+  transform: scale(0.97);
+}
+
+.menu:focus-visible,
+.design:focus-visible {
+  outline: 2px solid var(--thread);
+  outline-offset: 3px;
+}
+
+.reset:hover svg {
+  transform: rotate(150deg);
+}
+
+.reset:active {
+  transform: scale(0.97);
+}
+
+.reset:focus-visible {
+  outline: 2px solid var(--thread);
+  outline-offset: 3px;
+}
+
+.reset.spin svg {
+  animation: spin 600ms cubic-bezier(0.3, 0.7, 0.2, 1);
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+
+/* ------------------------------------------------------------------ status */
+
+.status {
+  position: fixed;
+  left: 50%;
+  bottom: calc(var(--bottom) + 64px);
+  transform: translateX(-50%);
+  max-width: calc(100vw - 2 * var(--gutter));
+  color: var(--paper-dim);
+  font: 13px/1.4 system-ui, -apple-system, sans-serif;
+  letter-spacing: 0.01em;
+  text-align: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 300ms ease;
+}
+
+.status.visible {
+  opacity: 1;
+}
+
+body.failed .loader {
+  opacity: 0;
+  visibility: hidden;
+}
+
+body.failed .status {
+  top: 50%;
+  bottom: auto;
+  transform: translate(-50%, -50%);
+}
+
+@media (max-width: 600px) {
+  .reset {
+    gap: 9px;
+    padding: 0 calc(17px - 0.22em) 0 14px;
+    font-size: 12px;
+    letter-spacing: 0.22em;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loader-needle,
+  .reset.spin svg,
+  .design {
+    animation: none;
+  }
+  .reset:hover svg {
+    transform: none;
+  }
+}

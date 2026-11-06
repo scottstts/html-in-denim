@@ -1,0 +1,39 @@
+/**
+ * Substep cost of the default scene (development only). Substeps are submitted back to back in
+ * batches of four, as the worker does per presented frame; the median batch time is reported.
+ *   SOLVER='{"pcgIterations":2}' node tools/gpu/run.mjs tools/gpu/scripts/bench.ts
+ * SCENE (JSON) overrides fields of the first layer's spec.
+ */
+import { compileScene, defaultSceneSpecs } from '../../../src/simulation/scene';
+import { GpuSolver, GPU_DEFAULTS } from '../../../src/simulation/gpu/solver';
+import { drain, gpuDevice } from '../env';
+
+const BATCH = 4;
+
+async function time(device: GPUDevice, solver: GpuSolver, reps = 12): Promise<number> {
+  const times: number[] = [];
+  for (let k = 0; k < reps; k++) {
+    const t0 = performance.now();
+    for (let b = 0; b < BATCH; b++) {
+      const enc = device.createCommandEncoder();
+      solver.encodeSubstep(enc);
+      device.queue.submit([enc.finish()]);
+    }
+    times.push((await drain(device, t0)) / BATCH);
+  }
+  times.sort((a, b) => a - b);
+  return times[Math.floor(reps / 2)];
+}
+
+export default async function main(): Promise<void> {
+  const device = await gpuDevice();
+  // SCENE='{"bundle":[3,2],"sizeU":0.4}' overrides the first layer's spec (resolution studies)
+  const specs = defaultSceneSpecs();
+  Object.assign(specs[0], JSON.parse(process.env.SCENE ?? '{}') as object);
+  const scene = compileScene(specs);
+  const solver = new GpuSolver(device, scene, { ...GPU_DEFAULTS, ...(JSON.parse(process.env.SOLVER ?? '{}') as object) });
+  await time(device, solver, 2);
+  const levels = solver.levels.map((l) => `${l.layers[0].nx}x${l.layers[0].ny}`).join(' ');
+  console.log(`nodes ${scene.nodeCount} levels ${levels}: ${(await time(device, solver)).toFixed(2)} ms/substep`);
+  device.destroy();
+}
